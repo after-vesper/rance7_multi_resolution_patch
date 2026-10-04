@@ -306,9 +306,7 @@ int mainCRTStartup(void)
     wsprintfW(msg,
               L"パッチをインストールしました:\n%s\n\n"
               L"使い方や設定の詳細は同梱の README_patch.txt をご覧"
-              L"ください。\n"
-              L"アンインストールするには、フォルダ内の dinput.dll と "
-              L"MultiRes.ini を削除してください。",
+              L"ください。",
               wdir);
     MessageBoxW(NULL, msg, L"Sengoku Rance Multi-Res Patch",
                 MB_ICONINFORMATION);
