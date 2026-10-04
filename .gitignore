@@ -4,3 +4,8 @@ Patch_Sample/
 *.dll
 *.ald
 *.ain
+r7.asm
+*.obj
+*.lib
+src/proxy/d3d9.dll
+src/proxy/dinput.dll
