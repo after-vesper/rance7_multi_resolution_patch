@@ -1,4 +1,4 @@
-Game_Sample/
+Game_Sample*/
 Patch_Sample/
 *.exe
 *.dll
@@ -10,3 +10,4 @@ r7.asm
 src/proxy/d3d9.dll
 src/proxy/dinput.dll
 dist/
+src/installer/embedded_assets.inc
