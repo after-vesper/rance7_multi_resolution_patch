@@ -24,6 +24,8 @@
 #define GAME_H 600
 
 static HMODULE g_dinput;
+static HINSTANCE g_hInst;
+static char g_iniPath[MAX_PATH];
 static int g_enabled;
 static int g_outW, g_outH, g_smooth, g_mode, g_full;
 static HWND g_hwnd;
@@ -61,6 +63,7 @@ static void load_config(void)
     while (n && path[n - 1] != '\\') n--;
     path[n] = 0;
     lstrcatA(path, "MultiRes.ini");
+    lstrcpyA(g_iniPath, path);
     g_outW = GetPrivateProfileIntA("Display", "Width", GAME_W, path);
     g_outH = GetPrivateProfileIntA("Display", "Height", GAME_H, path);
     g_smooth = GetPrivateProfileIntA("Display", "Filter", 1, path);
@@ -123,6 +126,7 @@ static void get_viewport(RECT *vp)
 }
 
 static void ensure_window_size(void);
+static void show_resolution_dialog(void);
 
 /* Subclass the game window so mouse-message client coords arrive in the
    800x600 logical space. Without this the game reads raw client coords
@@ -133,6 +137,7 @@ static WNDPROC g_origWndProc;
    to the System submenu. Chosen high to avoid colliding with the
    game's own command ids (they reach ~40100). */
 #define CMD_BORDERLESS 40200
+#define CMD_RESOLUTION 40201
 
 /* True when the engine's own exclusive fullscreen is active and we
    did not apply the borderless style. The engine strips the caption
@@ -155,7 +160,15 @@ static int native_fullscreen(void)
 
 static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (g_enabled) {
+    {
+        /* Resolution menu opens the picker dialog. Menu commands must
+           be handled even while scaling is disabled (800x600), or the
+           user could never turn it back on. */
+        if (msg == WM_COMMAND && LOWORD(wp) == CMD_RESOLUTION &&
+            !native_fullscreen()) {
+            show_resolution_dialog();
+            return 0;
+        }
         /* Our own borderless menu entry / Alt+B toggles the mode both
            ways. Alt+B is also the way back while borderless (the menu
            is hidden there). */
@@ -171,6 +184,10 @@ static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             } else {
                 g_full = !g_full;
             }
+            /* Borderless implies scaling is active even if the
+               configured resolution is the native 800x600. */
+            g_enabled = g_full ||
+                        (g_outW > GAME_W && g_outH > GAME_H);
             ensure_window_size();
             return 0;
         }
@@ -298,6 +315,158 @@ static void ensure_window_size(void)
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+/* --- resolution picker dialog ------------------------------------------- */
+
+/* Apply a new output resolution immediately and persist it to
+   MultiRes.ini so the same size is used on the next launch. */
+static void apply_resolution(int w, int h)
+{
+    char b[16];
+    g_outW = w;
+    g_outH = h;
+    g_enabled = g_full || (w > GAME_W && h > GAME_H);
+    wsprintfA(b, "%d", w);
+    WritePrivateProfileStringA("Display", "Width", b, g_iniPath);
+    wsprintfA(b, "%d", h);
+    WritePrivateProfileStringA("Display", "Height", b, g_iniPath);
+    ensure_window_size();
+}
+
+/* Parse "WxH" / "W x H" text from the combo box. */
+static int parse_resolution(const char *s, int *w, int *h)
+{
+    int a = 0, b = 0;
+    while (*s && (*s < '0' || *s > '9')) s++;
+    while (*s >= '0' && *s <= '9') a = a * 10 + *s++ - '0';
+    while (*s && (*s < '0' || *s > '9')) s++;
+    while (*s >= '0' && *s <= '9') b = b * 10 + *s++ - '0';
+    if (a < GAME_W || b < GAME_H)
+        return 0;
+    *w = a;
+    *h = b;
+    return 1;
+}
+
+/* The game ships no dialog resource for this, so the template is
+   built in memory: a combo box plus OK/Cancel buttons. */
+static BYTE g_dlgTpl[1024];
+
+static WORD *dlg_put_str(WORD *p, const WCHAR *s)
+{
+    while ((*p++ = *s++))
+        ;
+    return p;
+}
+
+static WORD *dlg_item(WORD *p, WORD cls, DWORD style, int x, int y,
+                      int cx, int cy, WORD id, const WCHAR *text)
+{
+    DLGITEMTEMPLATE *it;
+    p = (WORD *)(((ULONG_PTR)p + 3) & ~(ULONG_PTR)3);
+    it = (DLGITEMTEMPLATE *)p;
+    it->style = style;
+    it->dwExtendedStyle = 0;
+    it->x = (short)x;
+    it->y = (short)y;
+    it->cx = (short)cx;
+    it->cy = (short)cy;
+    it->id = id;
+    p = (WORD *)(it + 1);
+    *p++ = 0xFFFF;
+    *p++ = cls;
+    p = dlg_put_str(p, text);
+    *p++ = 0;
+    return p;
+}
+
+#define IDC_RES_COMBO 1001
+
+static void build_dialog_template(void)
+{
+    WORD *p = (WORD *)g_dlgTpl;
+    DLGTEMPLATE *t = (DLGTEMPLATE *)p;
+    t->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME |
+               DS_SETFONT;
+    t->dwExtendedStyle = 0;
+    t->cdit = 3;
+    t->x = 0;
+    t->y = 0;
+    t->cx = 210;
+    t->cy = 62;
+    p = (WORD *)(t + 1);
+    *p++ = 0;
+    *p++ = 0;
+    /* "ｶｲｿﾞｳﾄﾞ" in half-width katakana */
+    p = dlg_put_str(p, L"\xFF76\xFF72\xFF7E\xFF9E\xFF73"
+                      L"\xFF84\xFF9E");
+    *p++ = 9;
+    p = dlg_put_str(p, L"MS UI Gothic");
+    p = dlg_item(p, 0x0085,
+                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                     CBS_DROPDOWNLIST,
+                 10, 10, 190, 200, IDC_RES_COMBO, L"");
+    p = dlg_item(p, 0x0080,
+                 WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                     BS_DEFPUSHBUTTON,
+                 55, 38, 50, 14, IDOK, L"OK");
+    dlg_item(p, 0x0080,
+             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+             110, 38, 50, 14, IDCANCEL, L"Cancel");
+}
+
+static INT_PTR CALLBACK ResDlgProc(HWND dlg, UINT msg, WPARAM wp,
+                                   LPARAM lp)
+{
+    switch (msg) {
+    case WM_INITDIALOG: {
+        static const int res[][2] = {
+            {800, 600},   {1024, 768},  {1200, 900},  {1280, 960},
+            {1440, 1080}, {1600, 1200}, {1920, 1440}, {2400, 1800},
+            {2880, 2160}, {3200, 2400},
+        };
+        HWND cb = GetDlgItem(dlg, IDC_RES_COMBO);
+        char b[32];
+        int i, sel = -1;
+        for (i = 0; i < 10; i++) {
+            wsprintfA(b, "%d x %d", res[i][0], res[i][1]);
+            SendMessageA(cb, CB_ADDSTRING, 0, (LPARAM)b);
+            if (res[i][0] == g_outW && res[i][1] == g_outH)
+                sel = i;
+        }
+        if (sel < 0) {
+            wsprintfA(b, "%d x %d", g_outW, g_outH);
+            SendMessageA(cb, CB_ADDSTRING, 0, (LPARAM)b);
+            sel = i;
+        }
+        SendMessageA(cb, CB_SETCURSEL, sel, 0);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            char b[32];
+            int w, h;
+            GetDlgItemTextA(dlg, IDC_RES_COMBO, b, sizeof(b));
+            if (parse_resolution(b, &w, &h))
+                apply_resolution(w, h);
+            EndDialog(dlg, 0);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(dlg, 0);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static void show_resolution_dialog(void)
+{
+    build_dialog_template();
+    DialogBoxIndirectParamW(g_hInst, (LPCDLGTEMPLATEW)g_dlgTpl,
+                          g_hwnd, ResDlgProc, 0);
+}
+
 /* --- BitBlt hook --------------------------------------------------------- */
 
 /* Logical 800x600 back buffer. Every game blit is mirrored into it at
@@ -320,33 +489,43 @@ static void ensure_backbuffer(HDC dst)
 static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
                                HDC src, int sx, int sy, DWORD rop)
 {
-    if (g_enabled && cx > 0 && cy > 0 &&
+    if (cx > 0 && cy > 0 &&
         sx >= 0 && sy >= 0 && sx + cx <= GAME_W && sy + cy <= GAME_H) {
         HWND w;
         if (!g_hwnd)
             EnumWindows(find_game_window, (LPARAM)&g_hwnd);
         w = WindowFromDC(dst);
-        if (w && g_hwnd && w == g_hwnd && !native_fullscreen()) {
-            RECT vp;
-            if (!g_origWndProc) {
-                HMENU m, sys;
-                g_origWndProc = (WNDPROC)SetWindowLongPtrA(
-                    g_hwnd, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
-                /* Insert our borderless entry right under the game's
-                   own fullscreen item in the System submenu, using
-                   half-width katakana to match its style. */
-                m = GetMenu(g_hwnd);
-                sys = m ? GetSubMenu(m, 0) : NULL;
-                if (sys &&
-                    GetMenuState(sys, CMD_BORDERLESS, MF_BYCOMMAND)
-                        == (UINT)-1) {
-                    InsertMenuW(sys, 1, MF_BYPOSITION | MF_STRING,
-                                CMD_BORDERLESS,
-                                L"\xFF8E\xFF9E\xFF70\xFF80\xFF9E\xFF70"
-                                L"\xFF9A\xFF7D\xFF8C\xFF99\xFF7D\xFF78"
-                                L"\xFF98\xFF70\xFF9D(&B)      Alt+B");
-                }
+        /* Window detection, subclassing and menu injection run even
+           while scaling is disabled so the settings menu exists. */
+        if (w && g_hwnd && w == g_hwnd && !g_origWndProc) {
+            HMENU m, sys;
+            g_origWndProc = (WNDPROC)SetWindowLongPtrA(
+                g_hwnd, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
+            /* Insert our borderless entry right under the game's
+               own fullscreen item in the System submenu, using
+               half-width katakana to match its style. */
+            m = GetMenu(g_hwnd);
+            sys = m ? GetSubMenu(m, 0) : NULL;
+            if (sys &&
+                GetMenuState(sys, CMD_BORDERLESS, MF_BYCOMMAND)
+                    == (UINT)-1) {
+                InsertMenuW(sys, 1, MF_BYPOSITION | MF_STRING,
+                            CMD_BORDERLESS,
+                            L"\xFF8E\xFF9E\xFF70\xFF80\xFF9E\xFF70"
+                            L"\xFF9A\xFF7D\xFF8C\xFF99\xFF7D\xFF78"
+                            L"\xFF98\xFF70\xFF9D(&B)      Alt+B");
+                InsertMenuW(sys, 2,
+                            MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+                /* "ｶｲｿﾞｳﾄﾞ(&Z)..." in half-width katakana */
+                InsertMenuW(sys, 3, MF_BYPOSITION | MF_STRING,
+                            CMD_RESOLUTION,
+                            L"\xFF76\xFF72\xFF7E\xFF9E\xFF73"
+                            L"\xFF84\xFF9E(&Z)...");
             }
+        }
+        if (w && g_hwnd && w == g_hwnd && g_enabled &&
+            !native_fullscreen()) {
+            RECT vp;
             ensure_window_size();
             ensure_backbuffer(dst);
             get_viewport(&vp);
@@ -601,6 +780,7 @@ BOOL WINAPI DllMainCRTStartup(HINSTANCE inst, DWORD reason, void *res)
 {
     (void)inst; (void)res;
     if (reason == DLL_PROCESS_ATTACH) {
+        g_hInst = inst;
         /* The game is DPI-unaware. On high-DPI monitors (e.g. 4K at
            150%) Windows would bitmap-scale the whole window, blurring
            the output. Declare per-monitor awareness early so monitor
