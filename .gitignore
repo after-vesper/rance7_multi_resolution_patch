@@ -9,3 +9,4 @@ r7.asm
 *.lib
 src/proxy/d3d9.dll
 src/proxy/dinput.dll
+dist/
