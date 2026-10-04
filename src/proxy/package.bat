@@ -1,17 +1,31 @@
 @echo off
-rem Build the proxy DLL and assemble the distributable patch package
-rem under dist\SengokuRance_MultiResPatch (plus a .zip next to it).
+rem Build the proxy DLL and assemble the distributable patch package:
+rem   dist\SengokuRance_MultiResPatch\       raw files for manual install
+rem   dist\SengokuRance_MultiResPatch.zip
+rem   dist\SengokuRance_MultiResPatch_Setup.exe  self-contained installer
 setlocal
 cd /d %~dp0
 call build.bat || exit /b 1
 
+rem --- installer (embeds the freshly built files) ---
+python ..\installer\gen_assets.py ..\installer\embedded_assets.inc || exit /b 1
+
+set SDK=C:\Program Files (x86)\Windows Kits\10
+set VER=10.0.26100.0
+set INC=-I"%SDK%\Include\%VER%\um" -I"%SDK%\Include\%VER%\shared" -I"%SDK%\Include\%VER%\ucrt" -I..\installer
+set LIB=/libpath:"%SDK%\Lib\%VER%\um\x86" /libpath:"%SDK%\Lib\%VER%\ucrt\x86"
+
+clang --target=i686-pc-windows-msvc -O2 -fno-stack-protector -mno-stack-arg-probe %INC% -c ..\installer\installer.c -o ..\installer\installer.obj || exit /b 1
+lld-link -subsystem:windows -manifest:embed "-manifestuac:level='requireAdministrator' uiAccess='false'" -out:..\..\dist\SengokuRance_MultiResPatch_Setup.exe -entry:mainCRTStartup -nodefaultlib %LIB% ..\installer\installer.obj kernel32.lib user32.lib advapi32.lib || exit /b 1
+echo Built installer
+
+rem --- manual-install package ---
 set DIST=..\..\dist\SengokuRance_MultiResPatch
-if exist "%DIST%" rmdir /s /q "%DIST%"
-mkdir "%DIST%" || exit /b 1
+if not exist "%DIST%" mkdir "%DIST%" || exit /b 1
 copy /y dinput.dll "%DIST%\" >nul
 copy /y MultiRes.ini "%DIST%\" >nul
 copy /y ..\..\docs\README_patch.txt "%DIST%\README.txt" >nul || echo WARN: README missing
 
 powershell -NoProfile -Command "Compress-Archive -Force -Path '%DIST%' -DestinationPath '..\..\dist\SengokuRance_MultiResPatch.zip'" || exit /b 1
-echo Packaged to dist\SengokuRance_MultiResPatch\
+echo Packaged to dist\
 endlocal
