@@ -127,12 +127,30 @@ static void ensure_window_size(void);
    (e.g. as the start point of cursor warps), mixing coordinate spaces. */
 static WNDPROC g_origWndProc;
 
+/* True when the engine entered its own fullscreen (popup window) that
+   we did not request. In that state every hook must pass through so the
+   native path renders undisturbed. */
+static int native_fullscreen(void)
+{
+    return g_hwnd && !g_full &&
+           (GetWindowLongA(g_hwnd, GWL_STYLE) & WS_POPUP) != 0;
+}
+
 static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (g_enabled) {
+    if (g_enabled && !native_fullscreen()) {
         /* Alt+Enter toggles borderless fullscreen at runtime. */
         if (msg == WM_SYSKEYDOWN && wp == VK_RETURN &&
             (lp & (1 << 29))) {
+            g_full = !g_full;
+            ensure_window_size();
+            return 0;
+        }
+        /* The System menu's own "fullscreen" command (id 127) enters
+           the engine's exclusive fullscreen path, which conflicts with
+           this scaler. Redirect it to our borderless fullscreen so the
+           menu item and Alt+Enter behave identically. */
+        if (msg == WM_COMMAND && LOWORD(wp) == 127) {
             g_full = !g_full;
             ensure_window_size();
             return 0;
@@ -260,7 +278,7 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
         if (!g_hwnd)
             EnumWindows(find_game_window, (LPARAM)&g_hwnd);
         w = WindowFromDC(dst);
-        if (w && g_hwnd && w == g_hwnd) {
+        if (w && g_hwnd && w == g_hwnd && !native_fullscreen()) {
             RECT vp;
             if (!g_origWndProc)
                 g_origWndProc = (WNDPROC)SetWindowLongPtrA(
@@ -318,7 +336,7 @@ static BOOL WINAPI ScreenToClient_Hook(HWND hwnd, LPPOINT pt)
    the game window to the scaled position. */
 static BOOL WINAPI SetCursorPos_Hook(int x, int y)
 {
-    if (g_enabled && g_hwnd) {
+    if (g_enabled && g_hwnd && !native_fullscreen()) {
         POINT pt;
         pt.x = x;
         pt.y = y;
@@ -344,7 +362,7 @@ static BOOL WINAPI SetCursorPos_Hook(int x, int y)
 static BOOL WINAPI GetCursorPos_Hook(LPPOINT pt)
 {
     BOOL r = g_origGetCursorPos(pt);
-    if (r && g_enabled && g_hwnd) {
+    if (r && g_enabled && g_hwnd && !native_fullscreen()) {
         RECT vp;
         POINT c = *pt;
         g_origScreenToClient(g_hwnd, &c);
@@ -519,6 +537,14 @@ BOOL WINAPI DllMainCRTStartup(HINSTANCE inst, DWORD reason, void *res)
 {
     (void)inst; (void)res;
     if (reason == DLL_PROCESS_ATTACH) {
+        /* The game is DPI-unaware. On high-DPI monitors (e.g. 4K at
+           150%) Windows would bitmap-scale the whole window, blurring
+           the output. Declare per-monitor awareness early so monitor
+           rects and window metrics are real pixels and our scaler
+           renders at true output resolution. */
+        if (!SetProcessDpiAwarenessContext(
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+            SetProcessDPIAware();
         logmsg("dinput proxy loaded");
         if (!g_hooked) {
             g_hooked = 1;
