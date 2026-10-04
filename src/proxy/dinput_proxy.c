@@ -33,6 +33,7 @@ static int g_hooked;
 static int g_borderless_applied;
 static int g_appliedW, g_appliedH;
 static int g_sizing;
+static int g_log;
 
 typedef BOOL (WINAPI *PFN_BitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
 typedef BOOL (WINAPI *PFN_ScreenToClient)(HWND, LPPOINT);
@@ -47,7 +48,10 @@ static PFN_ClientToScreen g_origClientToScreen;
 
 static void logmsg(const char *s)
 {
-    HANDLE f = CreateFileA("multires_log.txt", GENERIC_WRITE, 0, NULL,
+    HANDLE f;
+    if (!g_log)
+        return;
+    f = CreateFileA("multires_log.txt", GENERIC_WRITE, 0, NULL,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     DWORD n;
     if (f == INVALID_HANDLE_VALUE) return;
@@ -70,6 +74,7 @@ static void load_config(void)
     g_smooth = GetPrivateProfileIntA("Display", "Filter", 1, path);
     g_mode = GetPrivateProfileIntA("Display", "ScaleMode", 1, path);
     g_full = GetPrivateProfileIntA("Display", "Fullscreen", 0, path);
+    g_log = GetPrivateProfileIntA("Debug", "Log", 0, path);
     /* Hooks stay enabled even at 800x600: the path degenerates to a
        1:1 transfer identical to the original behavior, and keeping it
        on avoids a special "disabled" state. */
