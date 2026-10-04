@@ -32,6 +32,7 @@ static HWND g_hwnd;
 static int g_hooked;
 static int g_borderless_applied;
 static int g_appliedW, g_appliedH;
+static int g_sizing;
 
 typedef BOOL (WINAPI *PFN_BitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
 typedef BOOL (WINAPI *PFN_ScreenToClient)(HWND, LPPOINT);
@@ -129,6 +130,7 @@ static void get_viewport(RECT *vp)
 }
 
 static void ensure_window_size(void);
+static void save_resolution(void);
 static void show_resolution_dialog(void);
 
 /* Subclass the game window so mouse-message client coords arrive in the
@@ -164,6 +166,21 @@ static int native_fullscreen(void)
 static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     {
+        /* Manual resizing: the window gets WS_THICKFRAME at injection
+           time. While the user drags the frame we adopt the live
+           client size as the output resolution so ensure_window_size
+           does not snap it back, and persist on WM_EXITSIZEMOVE. */
+        if (msg == WM_ENTERSIZEMOVE)
+            g_sizing = 1;
+        else if (msg == WM_SIZE && g_sizing && !g_full &&
+                 !native_fullscreen()) {
+            g_outW = (short)LOWORD(lp);
+            g_outH = (short)HIWORD(lp);
+        } else if (msg == WM_EXITSIZEMOVE) {
+            if (g_sizing)
+                save_resolution();
+            g_sizing = 0;
+        }
         /* Resolution menu opens the picker dialog. Menu commands must
            be handled even while scaling is disabled (800x600), or the
            user could never turn it back on. */
@@ -281,7 +298,8 @@ static void apply_fullscreen_state(void)
         g_appliedW = mon.right - mon.left;
         g_appliedH = mon.bottom - mon.top;
     } else if (g_savedStyle != -1) {
-        SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle);
+        /* Keep the window resizable after restoring its style. */
+        SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle | WS_THICKFRAME);
         if (g_savedMenu)
             SetMenu(g_hwnd, g_savedMenu);
         SetWindowPos(g_hwnd, NULL, g_savedRect.left, g_savedRect.top,
@@ -316,17 +334,24 @@ static void ensure_window_size(void)
 
 /* --- resolution picker dialog ------------------------------------------- */
 
+/* Persist the current output resolution so the next launch restores
+   the same size. */
+static void save_resolution(void)
+{
+    char b[16];
+    wsprintfA(b, "%d", g_outW);
+    WritePrivateProfileStringA("Display", "Width", b, g_iniPath);
+    wsprintfA(b, "%d", g_outH);
+    WritePrivateProfileStringA("Display", "Height", b, g_iniPath);
+}
+
 /* Apply a new output resolution immediately and persist it to
    MultiRes.ini so the same size is used on the next launch. */
 static void apply_resolution(int w, int h)
 {
-    char b[16];
     g_outW = w;
     g_outH = h;
-    wsprintfA(b, "%d", w);
-    WritePrivateProfileStringA("Display", "Width", b, g_iniPath);
-    wsprintfA(b, "%d", h);
-    WritePrivateProfileStringA("Display", "Height", b, g_iniPath);
+    save_resolution();
     ensure_window_size();
 }
 
@@ -496,8 +521,18 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
            while scaling is disabled so the settings menu exists. */
         if (w && g_hwnd && w == g_hwnd && !g_origWndProc) {
             HMENU m, sys;
+            LONG st;
             g_origWndProc = (WNDPROC)SetWindowLongPtrA(
                 g_hwnd, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
+            /* Make the window user-resizable; the scaler follows the
+               live client size. */
+            st = GetWindowLongA(g_hwnd, GWL_STYLE);
+            if (!(st & WS_THICKFRAME)) {
+                SetWindowLongA(g_hwnd, GWL_STYLE, st | WS_THICKFRAME);
+                SetWindowPos(g_hwnd, NULL, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
             /* Insert our borderless entry right under the game's
                own fullscreen item in the System submenu, using
                half-width katakana to match its style. */
