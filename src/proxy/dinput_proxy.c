@@ -319,9 +319,17 @@ static void ensure_window_size(void)
     apply_fullscreen_state();
     if (g_full)
         return;
-    GetClientRect(g_hwnd, &rc);
-    if (rc.right == g_outW && rc.bottom == g_outH)
-        return;
+    {
+        /* Skip once the client already matches the target. Compare the
+           client rect rather than the window rect so an oversized
+           window that the user dragged to a new position keeps its
+           position instead of being recentered every frame. */
+        RECT cr;
+        GetClientRect(g_hwnd, &cr);
+        if (cr.right - cr.left == g_outW &&
+            cr.bottom - cr.top == g_outH)
+            return;
+    }
     rc.left = rc.top = 0;
     rc.right = g_outW;
     rc.bottom = g_outH;
@@ -351,6 +359,30 @@ static void ensure_window_size(void)
                 x = wa.left;
             SetWindowPos(g_hwnd, NULL, x, y, ww, wh,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            {
+                /* AdjustWindowRectEx under-counts a wrapped menu, so
+                   measure the real client deficit and grow once. */
+                RECT cr;
+                GetClientRect(g_hwnd, &cr);
+                if (cr.right - cr.left != g_outW ||
+                    cr.bottom - cr.top != g_outH) {
+                    SetWindowPos(g_hwnd, NULL, x, y,
+                                 ww + g_outW - (cr.right - cr.left),
+                                 wh + g_outH - (cr.bottom - cr.top),
+                                 SWP_NOZORDER | SWP_NOACTIVATE);
+                    GetClientRect(g_hwnd, &cr);
+                    if (cr.right - cr.left != g_outW ||
+                        cr.bottom - cr.top != g_outH) {
+                        /* The window cannot grow further (the game
+                           caps it to the work area). Adopt the actual
+                           client size as the output resolution or we
+                           would recenter every frame and fight user
+                           drags. */
+                        g_outW = cr.right - cr.left;
+                        g_outH = cr.bottom - cr.top;
+                    }
+                }
+            }
         }
     }
 }
