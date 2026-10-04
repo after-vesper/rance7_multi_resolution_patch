@@ -1,0 +1,261 @@
+/*
+ * dinput.dll proxy for Sengoku Rance (System40) multi-resolution patch.
+ *
+ * The windowed renderer of this game is GDI-based: the engine draws the
+ * 800x600 main surface into a DIB section and blits it to the window DC
+ * with BitBlt. This proxy forwards DirectInput exports to the real
+ * dinput.dll and patches the exe's IAT entry for GDI32!BitBlt so that
+ * the final blit is stretched to the configured output size.
+ * The game window is resized to match.
+ *
+ * Config: MultiRes.ini next to the game exe
+ *   [Display]
+ *   Width  = 1600
+ *   Height = 1200
+ *   Filter = 1    ; 0 = nearest (COLORONCOLOR), 1 = smooth (HALFTONE)
+ */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#define GAME_W 800
+#define GAME_H 600
+
+static HMODULE g_dinput;
+static int g_enabled;
+static int g_outW, g_outH, g_smooth;
+static HWND g_hwnd;
+static int g_hooked;
+
+typedef BOOL (WINAPI *PFN_BitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
+typedef BOOL (WINAPI *PFN_ScreenToClient)(HWND, LPPOINT);
+static PFN_BitBlt g_origBitBlt;
+static PFN_ScreenToClient g_origScreenToClient;
+
+static void logmsg(const char *s)
+{
+    HANDLE f = CreateFileA("multires_log.txt", GENERIC_WRITE, 0, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD n;
+    if (f == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(f, 0, NULL, FILE_END);
+    WriteFile(f, s, lstrlenA(s), &n, NULL);
+    WriteFile(f, "\r\n", 2, &n, NULL);
+    CloseHandle(f);
+}
+
+static void load_config(void)
+{
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    while (n && path[n - 1] != '\\') n--;
+    path[n] = 0;
+    lstrcatA(path, "MultiRes.ini");
+    g_outW = GetPrivateProfileIntA("Display", "Width", GAME_W, path);
+    g_outH = GetPrivateProfileIntA("Display", "Height", GAME_H, path);
+    g_smooth = GetPrivateProfileIntA("Display", "Filter", 1, path);
+    g_enabled = g_outW > GAME_W && g_outH > GAME_H;
+}
+
+/* --- window management -------------------------------------------------- */
+
+static BOOL CALLBACK find_game_window(HWND hwnd, LPARAM lp)
+{
+    char cls[64];
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd))
+        return TRUE;
+    if (GetClassNameA(hwnd, cls, sizeof(cls)) &&
+        lstrcmpA(cls, "Sys40WindowClass") == 0) {
+        *(HWND *)lp = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void ensure_window_size(void)
+{
+    RECT rc;
+    if (!g_hwnd)
+        return;
+    GetClientRect(g_hwnd, &rc);
+    if (rc.right == g_outW && rc.bottom == g_outH)
+        return;
+    rc.left = rc.top = 0;
+    rc.right = g_outW;
+    rc.bottom = g_outH;
+    AdjustWindowRectEx(&rc, GetWindowLongA(g_hwnd, GWL_STYLE),
+                       GetMenu(g_hwnd) != NULL,
+                       GetWindowLongA(g_hwnd, GWL_EXSTYLE));
+    SetWindowPos(g_hwnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/* --- BitBlt hook --------------------------------------------------------- */
+
+static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
+                               HDC src, int sx, int sy, DWORD rop)
+{
+    if (g_enabled && cx == GAME_W && cy == GAME_H) {
+        HWND w;
+        if (!g_hwnd)
+            EnumWindows(find_game_window, (LPARAM)&g_hwnd);
+        w = WindowFromDC(dst);
+        if (w && g_hwnd && w == g_hwnd) {
+            RECT rc;
+            ensure_window_size();
+            GetClientRect(w, &rc);
+            SetStretchBltMode(dst, g_smooth ? HALFTONE : COLORONCOLOR);
+            if (g_smooth)
+                SetBrushOrgEx(dst, 0, 0, NULL);
+            return StretchBlt(dst, 0, 0, rc.right, rc.bottom,
+                              src, sx, sy, GAME_W, GAME_H, rop);
+        }
+    }
+    return g_origBitBlt(dst, x, y, cx, cy, src, sx, sy, rop);
+}
+
+/* Convert the scaled client coordinate back to the 800x600 game space. */
+static BOOL WINAPI ScreenToClient_Hook(HWND hwnd, LPPOINT pt)
+{
+    BOOL r = g_origScreenToClient(hwnd, pt);
+    if (r && g_enabled && hwnd == g_hwnd) {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        if (rc.right > 0 && rc.bottom > 0) {
+            pt->x = MulDiv(pt->x, GAME_W, rc.right);
+            pt->y = MulDiv(pt->y, GAME_H, rc.bottom);
+        }
+    }
+    return r;
+}
+
+static void patch_import_thunk(PIMAGE_IMPORT_DESCRIPTOR imp,
+                               BYTE *base, const char *dllname,
+                               FARPROC real, void *hook,
+                               const char *label)
+{
+    for (; imp->Name; imp++) {
+        const char *name = (const char *)(base + imp->Name);
+        if (lstrcmpiA(name, dllname) == 0)
+            break;
+    }
+    if (!imp->Name) { logmsg("import dll not found"); logmsg(dllname); return; }
+    {
+        DWORD *thunk = (DWORD *)(base + imp->FirstThunk);
+        DWORD i;
+        for (i = 0; thunk[i]; i++) {
+            if (thunk[i] == (DWORD)(UINT_PTR)real) {
+                DWORD old;
+                VirtualProtect(&thunk[i], sizeof(DWORD),
+                               PAGE_EXECUTE_READWRITE, &old);
+                thunk[i] = (DWORD)(UINT_PTR)hook;
+                VirtualProtect(&thunk[i], sizeof(DWORD), old, &old);
+                FlushInstructionCache(GetCurrentProcess(),
+                                      &thunk[i], sizeof(DWORD));
+                logmsg(label);
+                return;
+            }
+        }
+    }
+    logmsg("thunk not found");
+    logmsg(dllname);
+}
+
+static void hook_iat(void)
+{
+    HMODULE exe = GetModuleHandleA(NULL);
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)exe;
+    PIMAGE_NT_HEADERS nt =
+        (PIMAGE_NT_HEADERS)((BYTE *)exe + dos->e_lfanew);
+    PIMAGE_IMPORT_DESCRIPTOR imp =
+        (PIMAGE_IMPORT_DESCRIPTOR)((BYTE *)exe +
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                .VirtualAddress);
+    {
+        FARPROC real;
+        HMODULE gdi = GetModuleHandleA("GDI32.dll");
+        if (gdi && (real = GetProcAddress(gdi, "BitBlt")) != NULL) {
+            g_origBitBlt = (PFN_BitBlt)real;
+            patch_import_thunk(imp, (BYTE *)exe, "GDI32.dll", real,
+                               BitBlt_Hook, "BitBlt IAT hooked");
+        } else {
+            logmsg("GDI32!BitBlt not found");
+        }
+    }
+    {
+        FARPROC real;
+        HMODULE u32 = GetModuleHandleA("USER32.dll");
+        if (u32 && (real = GetProcAddress(u32, "ScreenToClient")) != NULL) {
+            g_origScreenToClient = (PFN_ScreenToClient)real;
+            patch_import_thunk(imp, (BYTE *)exe, "USER32.dll", real,
+                               ScreenToClient_Hook, "ScreenToClient IAT hooked");
+        } else {
+            logmsg("USER32!ScreenToClient not resolved");
+        }
+    }
+}
+
+/* --- dinput.dll forwards ------------------------------------------------- */
+
+static void load_real(void)
+{
+    char sys[MAX_PATH];
+    if (g_dinput) return;
+    GetSystemDirectoryA(sys, MAX_PATH);
+    lstrcatA(sys, "\\dinput.dll");
+    g_dinput = LoadLibraryA(sys);
+}
+
+#define FORWARD(fn) \
+    load_real(); \
+    if (!g_dinput) return E_FAIL; \
+    return ((PFN_##fn)GetProcAddress(g_dinput, #fn))
+
+typedef HRESULT (WINAPI *PFN_DirectInputCreateA)(HINSTANCE, DWORD, LPVOID *, LPVOID);
+typedef HRESULT (WINAPI *PFN_DirectInputCreateW)(HINSTANCE, DWORD, LPVOID *, LPVOID);
+typedef HRESULT (WINAPI *PFN_DirectInputCreateEx)(HINSTANCE, DWORD, REFIID, LPVOID *, LPVOID);
+typedef HRESULT (WINAPI *PFN_DllGetClassObject)(REFCLSID, REFIID, LPVOID *);
+typedef HRESULT (WINAPI *PFN_DllCanUnloadNow)(void);
+typedef HRESULT (WINAPI *PFN_DllRegisterServer)(void);
+typedef HRESULT (WINAPI *PFN_DllUnregisterServer)(void);
+
+HRESULT WINAPI DirectInputCreateA(HINSTANCE a, DWORD b, LPVOID *c, LPVOID d)
+{ FORWARD(DirectInputCreateA)(a, b, c, d); }
+
+HRESULT WINAPI DirectInputCreateW(HINSTANCE a, DWORD b, LPVOID *c, LPVOID d)
+{ FORWARD(DirectInputCreateW)(a, b, c, d); }
+
+HRESULT WINAPI DirectInputCreateEx(HINSTANCE a, DWORD b, REFIID c, LPVOID *d, LPVOID e)
+{
+    load_real();
+    if (!g_dinput) return E_FAIL;
+    return ((PFN_DirectInputCreateEx)GetProcAddress(g_dinput,
+        "DirectInputCreateEx"))(a, b, c, d, e);
+}
+
+HRESULT WINAPI DllGetClassObject(REFCLSID a, REFIID b, LPVOID *c)
+{ FORWARD(DllGetClassObject)(a, b, c); }
+
+HRESULT WINAPI DllCanUnloadNow(void)
+{ FORWARD(DllCanUnloadNow)(); }
+
+HRESULT WINAPI DllRegisterServer(void)
+{ FORWARD(DllRegisterServer)(); }
+
+HRESULT WINAPI DllUnregisterServer(void)
+{ FORWARD(DllUnregisterServer)(); }
+
+BOOL WINAPI DllMainCRTStartup(HINSTANCE inst, DWORD reason, void *res)
+{
+    (void)inst; (void)res;
+    if (reason == DLL_PROCESS_ATTACH) {
+        logmsg("dinput proxy loaded");
+        if (!g_hooked) {
+            g_hooked = 1;
+            load_config();
+            hook_iat();
+        }
+    }
+    return TRUE;
+}
