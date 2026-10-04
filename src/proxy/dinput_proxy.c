@@ -16,6 +16,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 
 #define GAME_W 800
 #define GAME_H 600
@@ -28,8 +29,12 @@ static int g_hooked;
 
 typedef BOOL (WINAPI *PFN_BitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
 typedef BOOL (WINAPI *PFN_ScreenToClient)(HWND, LPPOINT);
+typedef BOOL (WINAPI *PFN_SetCursorPos)(int, int);
+typedef BOOL (WINAPI *PFN_ClientToScreen)(HWND, LPPOINT);
 static PFN_BitBlt g_origBitBlt;
 static PFN_ScreenToClient g_origScreenToClient;
+static PFN_SetCursorPos g_origSetCursorPos;
+static PFN_ClientToScreen g_origClientToScreen;
 
 static void logmsg(const char *s)
 {
@@ -96,20 +101,33 @@ static void ensure_window_size(void)
 static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
                                HDC src, int sx, int sy, DWORD rop)
 {
-    if (g_enabled && cx == GAME_W && cy == GAME_H) {
+    if (g_enabled && cx > 0 && cy > 0 &&
+        sx >= 0 && sy >= 0 && sx + cx <= GAME_W && sy + cy <= GAME_H) {
         HWND w;
         if (!g_hwnd)
             EnumWindows(find_game_window, (LPARAM)&g_hwnd);
         w = WindowFromDC(dst);
         if (w && g_hwnd && w == g_hwnd) {
+            static int blog;
             RECT rc;
+            int dx, dy, dw, dh;
+            if (blog < 5) {
+                blog++;
+                logmsg("scaled blit");
+            }
             ensure_window_size();
             GetClientRect(w, &rc);
+            /* Scale the partial-update rect proportionally so dirty-rect
+               blits land at the right place. */
+            dx = MulDiv(x, rc.right, GAME_W);
+            dy = MulDiv(y, rc.bottom, GAME_H);
+            dw = MulDiv(x + cx, rc.right, GAME_W) - dx;
+            dh = MulDiv(y + cy, rc.bottom, GAME_H) - dy;
             SetStretchBltMode(dst, g_smooth ? HALFTONE : COLORONCOLOR);
             if (g_smooth)
-                SetBrushOrgEx(dst, 0, 0, NULL);
-            return StretchBlt(dst, 0, 0, rc.right, rc.bottom,
-                              src, sx, sy, GAME_W, GAME_H, rop);
+                SetBrushOrgEx(dst, dx, dy, NULL);
+            return StretchBlt(dst, dx, dy, dw, dh,
+                              src, sx, sy, cx, cy, rop);
         }
     }
     return g_origBitBlt(dst, x, y, cx, cy, src, sx, sy, rop);
@@ -118,7 +136,16 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
 /* Convert the scaled client coordinate back to the 800x600 game space. */
 static BOOL WINAPI ScreenToClient_Hook(HWND hwnd, LPPOINT pt)
 {
-    BOOL r = g_origScreenToClient(hwnd, pt);
+    BOOL r;
+    char buf[96];
+    static int count;
+    r = g_origScreenToClient(hwnd, pt);
+    if (count < 20) {
+        count++;
+        wsprintfA(buf, "S2C hwnd=%p game=%p in=(%ld,%ld) enabled=%d",
+                  hwnd, g_hwnd, pt->x, pt->y, g_enabled);
+        logmsg(buf);
+    }
     if (r && g_enabled && hwnd == g_hwnd) {
         RECT rc;
         GetClientRect(hwnd, &rc);
@@ -128,6 +155,28 @@ static BOOL WINAPI ScreenToClient_Hook(HWND hwnd, LPPOINT pt)
         }
     }
     return r;
+}
+
+/* The game auto-moves the cursor with SetCursorPos using positions in
+   the unscaled 800x600 space. Re-map screen coordinates that fall inside
+   the game window to the scaled position. */
+static BOOL WINAPI SetCursorPos_Hook(int x, int y)
+{
+    if (g_enabled && g_hwnd) {
+        POINT pt;
+        pt.x = x;
+        pt.y = y;
+        g_origScreenToClient(g_hwnd, &pt);
+        if (pt.x >= 0 && pt.x < GAME_W && pt.y >= 0 && pt.y < GAME_H) {
+            RECT rc;
+            GetClientRect(g_hwnd, &rc);
+            pt.x = MulDiv(pt.x, rc.right, GAME_W);
+            pt.y = MulDiv(pt.y, rc.bottom, GAME_H);
+            g_origClientToScreen(g_hwnd, &pt);
+            return g_origSetCursorPos(pt.x, pt.y);
+        }
+    }
+    return g_origSetCursorPos(x, y);
 }
 
 static void patch_import_thunk(PIMAGE_IMPORT_DESCRIPTOR imp,
@@ -144,7 +193,18 @@ static void patch_import_thunk(PIMAGE_IMPORT_DESCRIPTOR imp,
     {
         DWORD *thunk = (DWORD *)(base + imp->FirstThunk);
         DWORD i;
+        char dbg[160];
+        int verbose = (hook == SetCursorPos_Hook);
+        if (verbose) {
+            wsprintfA(dbg, "scan %s base=%p real=%p", dllname, base, real);
+            logmsg(dbg);
+        }
         for (i = 0; thunk[i]; i++) {
+            if (verbose) {
+                wsprintfA(dbg, "  thunk[%u]=%p", i,
+                          (void *)(UINT_PTR)thunk[i]);
+                logmsg(dbg);
+            }
             if (thunk[i] == (DWORD)(UINT_PTR)real) {
                 DWORD old;
                 VirtualProtect(&thunk[i], sizeof(DWORD),
@@ -162,38 +222,74 @@ static void patch_import_thunk(PIMAGE_IMPORT_DESCRIPTOR imp,
     logmsg(dllname);
 }
 
+static void hook_module(HMODULE mod, const char *dllname, FARPROC real,
+                        void *hook, const char *label)
+{
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)mod;
+    PIMAGE_NT_HEADERS nt;
+    PIMAGE_IMPORT_DESCRIPTOR imp;
+    if (!mod || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+    nt = (PIMAGE_NT_HEADERS)((BYTE *)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return;
+    if (!nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+            .VirtualAddress)
+        return;
+    imp = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE *)mod +
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+            .VirtualAddress);
+    patch_import_thunk(imp, (BYTE *)mod, dllname, real, hook, label);
+}
+
+/* Patch BitBlt/ScreenToClient thunks in every loaded module: mouse and
+   blit code may live in engine DLLs (Sys42VM, SACT2, ...), not just exe. */
 static void hook_iat(void)
 {
-    HMODULE exe = GetModuleHandleA(NULL);
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)exe;
-    PIMAGE_NT_HEADERS nt =
-        (PIMAGE_NT_HEADERS)((BYTE *)exe + dos->e_lfanew);
-    PIMAGE_IMPORT_DESCRIPTOR imp =
-        (PIMAGE_IMPORT_DESCRIPTOR)((BYTE *)exe +
-            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
-                .VirtualAddress);
-    {
-        FARPROC real;
-        HMODULE gdi = GetModuleHandleA("GDI32.dll");
-        if (gdi && (real = GetProcAddress(gdi, "BitBlt")) != NULL) {
-            g_origBitBlt = (PFN_BitBlt)real;
-            patch_import_thunk(imp, (BYTE *)exe, "GDI32.dll", real,
-                               BitBlt_Hook, "BitBlt IAT hooked");
-        } else {
-            logmsg("GDI32!BitBlt not found");
-        }
+    HANDLE snap;
+    MODULEENTRY32 me;
+    HMODULE gdi, u32;
+    FARPROC realBitBlt, realS2C, realSCP;
+
+    gdi = GetModuleHandleA("GDI32.dll");
+    u32 = GetModuleHandleA("USER32.dll");
+    realBitBlt = gdi ? GetProcAddress(gdi, "BitBlt") : NULL;
+    realS2C = u32 ? GetProcAddress(u32, "ScreenToClient") : NULL;
+    realSCP = u32 ? GetProcAddress(u32, "SetCursorPos") : NULL;
+    if (realBitBlt) g_origBitBlt = (PFN_BitBlt)realBitBlt;
+    if (realS2C) g_origScreenToClient = (PFN_ScreenToClient)realS2C;
+    if (realSCP) g_origSetCursorPos = (PFN_SetCursorPos)realSCP;
+    if (u32)
+        g_origClientToScreen =
+            (PFN_ClientToScreen)GetProcAddress(u32, "ClientToScreen");
+
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                    GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) {
+        hook_module(GetModuleHandleA(NULL), "GDI32.dll", realBitBlt,
+                    BitBlt_Hook, "BitBlt IAT hooked");
+        hook_module(GetModuleHandleA(NULL), "USER32.dll", realS2C,
+                    ScreenToClient_Hook, "ScreenToClient IAT hooked");
+        hook_module(GetModuleHandleA(NULL), "USER32.dll", realSCP,
+                    SetCursorPos_Hook, "SetCursorPos IAT hooked");
+        return;
     }
-    {
-        FARPROC real;
-        HMODULE u32 = GetModuleHandleA("USER32.dll");
-        if (u32 && (real = GetProcAddress(u32, "ScreenToClient")) != NULL) {
-            g_origScreenToClient = (PFN_ScreenToClient)real;
-            patch_import_thunk(imp, (BYTE *)exe, "USER32.dll", real,
-                               ScreenToClient_Hook, "ScreenToClient IAT hooked");
-        } else {
-            logmsg("USER32!ScreenToClient not resolved");
-        }
+    me.dwSize = sizeof(me);
+    if (Module32First(snap, &me)) {
+        do {
+            if (realBitBlt)
+                hook_module(me.hModule, "GDI32.dll", realBitBlt,
+                            BitBlt_Hook, "BitBlt IAT hooked");
+            if (realS2C)
+                hook_module(me.hModule, "USER32.dll", realS2C,
+                            ScreenToClient_Hook, "ScreenToClient IAT hooked");
+            if (realSCP)
+                hook_module(me.hModule, "USER32.dll", realSCP,
+                            SetCursorPos_Hook, "SetCursorPos IAT hooked");
+        } while (Module32Next(snap, &me));
     }
+    CloseHandle(snap);
+    logmsg("IAT scan done");
 }
 
 /* --- dinput.dll forwards ------------------------------------------------- */
