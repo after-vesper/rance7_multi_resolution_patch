@@ -340,15 +340,18 @@ static void ensure_window_size(void)
         mi.cbSize = sizeof(mi);
         GetMonitorInfoA(hm, &mi);
         wa = mi.rcWork;
-        /* If the window does not fit the work area, clamp to the
-           monitor rect. */
-        if (ww > wa.right - wa.left || wh > wa.bottom - wa.top)
-            wa = mi.rcMonitor;
-        SetWindowPos(g_hwnd, NULL,
-                     wa.left + (wa.right - wa.left - ww) / 2,
-                     wa.top + (wa.bottom - wa.top - wh) / 2,
-                     ww, wh,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
+        {
+            int x = wa.left + (wa.right - wa.left - ww) / 2;
+            int y = wa.top + (wa.bottom - wa.top - wh) / 2;
+            /* Oversized windows must not spill past the top/left edge
+               or the title bar becomes unreachable. */
+            if (y < wa.top)
+                y = wa.top;
+            if (x < wa.left)
+                x = wa.left;
+            SetWindowPos(g_hwnd, NULL, x, y, ww, wh,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
 }
 
