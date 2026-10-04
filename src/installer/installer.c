@@ -224,6 +224,15 @@ static int detect_game_dir(char *out, DWORD cap)
 
 /* --- folder picker ------------------------------------------------------- */
 
+/* UI text uses the wide APIs: the source file is UTF-8 and the A
+   functions would decode the literals as the system ANSI codepage,
+   producing mojibake. */
+static void to_wide(const char *src, WCHAR *dst, DWORD cap)
+{
+    if (!MultiByteToWideChar(CP_ACP, 0, src, -1, dst, cap))
+        dst[0] = 0;
+}
+
 static int CALLBACK browse_cb(HWND hwnd, UINT msg, LPARAM lp, LPARAM data)
 {
     (void)lp;
@@ -234,17 +243,17 @@ static int CALLBACK browse_cb(HWND hwnd, UINT msg, LPARAM lp, LPARAM data)
 
 static int browse_dir(char *out, DWORD cap)
 {
-    BROWSEINFOA bi;
+    BROWSEINFOW bi;
     LPITEMIDLIST pidl;
     zero(&bi, sizeof(bi));
     bi.lpszTitle =
-        "Select the game folder containing " GAME_EXE " / "
-        "Rance7.exe があるフォルダを選択してください";
+        L"Select the game folder containing Rance7.exe / "
+        L"Rance7.exe があるフォルダを選択してください";
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
     bi.lpfn = browse_cb;
     bi.lParam = (LPARAM)out;
     CoInitialize(NULL);
-    pidl = SHBrowseForFolderA(&bi);
+    pidl = SHBrowseForFolderW(&bi);
     if (pidl && SHGetPathFromIDListA(pidl, out)) {
         CoTaskMemFree(pidl);
         CoUninitialize();
@@ -274,18 +283,20 @@ static int write_file(const char *dir, const struct file_entry *fe)
 
 int mainCRTStartup(void)
 {
-    char dir[MAX_PATH], msg[1024], p[MAX_PATH];
+    char dir[MAX_PATH], p[MAX_PATH];
+    WCHAR msg[1024], wdir[MAX_PATH];
     DWORD i;
     int detected;
 
     dir[0] = 0;
     detected = detect_game_dir(dir, sizeof(dir));
     if (detected) {
-        wsprintfA(msg,
-                  "Game found:\n%s\n\nInstall the patch to this "
-                  "folder?\n\nこのフォルダにパッチを適用しますか?",
-                  dir);
-        if (MessageBoxA(NULL, msg, "Sengoku Rance Multi-Res Patch",
+        to_wide(dir, wdir, MAX_PATH);
+        wsprintfW(msg,
+                  L"Game found:\n%s\n\nInstall the patch to this "
+                  L"folder?\n\nこのフォルダにパッチを適用しますか?",
+                  wdir);
+        if (MessageBoxW(NULL, msg, L"Sengoku Rance Multi-Res Patch",
                         MB_YESNO | MB_ICONQUESTION) != IDYES)
             dir[0] = 0;
         else if (!file_exists(dir, GAME_EXE))
@@ -296,11 +307,11 @@ int mainCRTStartup(void)
         if (!browse_dir(dir, sizeof(dir)))
             return 0; /* cancelled */
         if (!file_exists(dir, GAME_EXE)) {
-            if (MessageBoxA(NULL,
-                            GAME_EXE " was not found in the selected "
-                            "folder.\n選択したフォルダに " GAME_EXE
-                            " が見つかりません。\n\nChoose again?",
-                            "Sengoku Rance Multi-Res Patch",
+            if (MessageBoxW(NULL,
+                            L"Rance7.exe was not found in the selected "
+                            L"folder.\n選択したフォルダに Rance7.exe "
+                            L"が見つかりません。\n\nChoose again?",
+                            L"Sengoku Rance Multi-Res Patch",
                             MB_YESNO | MB_ICONWARNING) != IDYES)
                 return 0;
             dir[0] = 0;
@@ -324,21 +335,24 @@ int mainCRTStartup(void)
             GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES)
             continue; /* keep the user's existing settings file */
         if (!write_file(dir, &FILES[i])) {
-            wsprintfA(msg, "Failed to write %s\n%s",
-                      FILES[i].name, fp);
-            MessageBoxA(NULL, msg, "Install failed", MB_ICONERROR);
+            WCHAR wname[64];
+            to_wide(FILES[i].name, wname, 64);
+            to_wide(fp, wdir, MAX_PATH);
+            wsprintfW(msg, L"Failed to write %s\n%s", wname, wdir);
+            MessageBoxW(NULL, msg, L"Install failed", MB_ICONERROR);
             return 1;
         }
     }
 
-    wsprintfA(msg,
-              "Patch installed to:\n%s\n\n"
-              "Uninstall: delete dinput.dll and MultiRes.ini in that "
-              "folder.\n\nパッチをインストールしました。\n"
-              "アンインストール: フォルダ内の dinput.dll と "
-              "MultiRes.ini を削除してください。",
-              dir);
-    MessageBoxA(NULL, msg, "Sengoku Rance Multi-Res Patch",
+    to_wide(dir, wdir, MAX_PATH);
+    wsprintfW(msg,
+              L"Patch installed to:\n%s\n\n"
+              L"Uninstall: delete dinput.dll and MultiRes.ini in that "
+              L"folder.\n\nパッチをインストールしました。\n"
+              L"アンインストール: フォルダ内の dinput.dll と "
+              L"MultiRes.ini を削除してください。",
+              wdir);
+    MessageBoxW(NULL, msg, L"Sengoku Rance Multi-Res Patch",
                 MB_ICONINFORMATION);
     return 0;
 }
