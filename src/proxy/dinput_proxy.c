@@ -30,10 +30,12 @@ static int g_hooked;
 typedef BOOL (WINAPI *PFN_BitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
 typedef BOOL (WINAPI *PFN_ScreenToClient)(HWND, LPPOINT);
 typedef BOOL (WINAPI *PFN_SetCursorPos)(int, int);
+typedef BOOL (WINAPI *PFN_GetCursorPos)(LPPOINT);
 typedef BOOL (WINAPI *PFN_ClientToScreen)(HWND, LPPOINT);
 static PFN_BitBlt g_origBitBlt;
 static PFN_ScreenToClient g_origScreenToClient;
 static PFN_SetCursorPos g_origSetCursorPos;
+static PFN_GetCursorPos g_origGetCursorPos;
 static PFN_ClientToScreen g_origClientToScreen;
 
 static void logmsg(const char *s)
@@ -78,6 +80,38 @@ static BOOL CALLBACK find_game_window(HWND hwnd, LPARAM lp)
     return TRUE;
 }
 
+/* Subclass the game window so mouse-message client coords arrive in the
+   800x600 logical space. Without this the game reads raw client coords
+   (e.g. as the start point of cursor warps), mixing coordinate spaces. */
+static WNDPROC g_origWndProc;
+
+static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (g_enabled) {
+        switch (msg) {
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
+        case WM_MOUSEHOVER: {
+            RECT rc;
+            short x, y;
+            GetClientRect(hwnd, &rc);
+            x = (short)LOWORD(lp);
+            y = (short)HIWORD(lp);
+            x = (short)MulDiv(x, GAME_W, rc.right);
+            y = (short)MulDiv(y, GAME_H, rc.bottom);
+            lp = MAKELPARAM((WORD)x, (WORD)y);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return CallWindowProcA(g_origWndProc, hwnd, msg, wp, lp);
+}
+
 static void ensure_window_size(void)
 {
     RECT rc;
@@ -108,13 +142,11 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
             EnumWindows(find_game_window, (LPARAM)&g_hwnd);
         w = WindowFromDC(dst);
         if (w && g_hwnd && w == g_hwnd) {
-            static int blog;
+            if (!g_origWndProc)
+                g_origWndProc = (WNDPROC)SetWindowLongPtrA(
+                    g_hwnd, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
             RECT rc;
             int dx, dy, dw, dh;
-            if (blog < 5) {
-                blog++;
-                logmsg("scaled blit");
-            }
             ensure_window_size();
             GetClientRect(w, &rc);
             /* Scale the partial-update rect proportionally so dirty-rect
@@ -137,23 +169,11 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
 static BOOL WINAPI ScreenToClient_Hook(HWND hwnd, LPPOINT pt)
 {
     BOOL r;
-    char buf[96];
-    static int count;
     r = g_origScreenToClient(hwnd, pt);
-    if (count < 20) {
-        count++;
-        wsprintfA(buf, "S2C hwnd=%p game=%p in=(%ld,%ld) enabled=%d",
-                  hwnd, g_hwnd, pt->x, pt->y, g_enabled);
-        logmsg(buf);
-    }
-    if (r && g_enabled && hwnd == g_hwnd) {
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        if (rc.right > 0 && rc.bottom > 0) {
-            pt->x = MulDiv(pt->x, GAME_W, rc.right);
-            pt->y = MulDiv(pt->y, GAME_H, rc.bottom);
-        }
-    }
+    /* Inputs are already logical screen coords once GetCursorPos is
+       hooked, so the client-space result is logical too. Do not rescale
+       here or the position would be converted twice. */
+    (void)g_hwnd;
     return r;
 }
 
@@ -167,7 +187,11 @@ static BOOL WINAPI SetCursorPos_Hook(int x, int y)
         pt.x = x;
         pt.y = y;
         g_origScreenToClient(g_hwnd, &pt);
-        if (pt.x >= 0 && pt.x < GAME_W && pt.y >= 0 && pt.y < GAME_H) {
+        {
+            /* The game emits warp targets in 800x600 logical space, but
+               glides interpolate from the real cursor position, so values
+               may exceed the logical range. Scale everything uniformly;
+               out-of-range results are clamped by SetCursorPos anyway. */
             RECT rc;
             GetClientRect(g_hwnd, &rc);
             pt.x = MulDiv(pt.x, rc.right, GAME_W);
@@ -177,6 +201,25 @@ static BOOL WINAPI SetCursorPos_Hook(int x, int y)
         }
     }
     return g_origSetCursorPos(x, y);
+}
+
+/* Report the cursor position in 800x600 logical space (expressed as
+   screen coords) so the game computes consistent positions even through
+   paths that use raw screen coordinates. */
+static BOOL WINAPI GetCursorPos_Hook(LPPOINT pt)
+{
+    BOOL r = g_origGetCursorPos(pt);
+    if (r && g_enabled && g_hwnd) {
+        RECT rc;
+        POINT c = *pt;
+        g_origScreenToClient(g_hwnd, &c);
+        GetClientRect(g_hwnd, &rc);
+        c.x = MulDiv(c.x, GAME_W, rc.right);
+        c.y = MulDiv(c.y, GAME_H, rc.bottom);
+        g_origClientToScreen(g_hwnd, &c);
+        *pt = c;
+    }
+    return r;
 }
 
 static void patch_import_thunk(PIMAGE_IMPORT_DESCRIPTOR imp,
@@ -193,18 +236,7 @@ static void patch_import_thunk(PIMAGE_IMPORT_DESCRIPTOR imp,
     {
         DWORD *thunk = (DWORD *)(base + imp->FirstThunk);
         DWORD i;
-        char dbg[160];
-        int verbose = (hook == SetCursorPos_Hook);
-        if (verbose) {
-            wsprintfA(dbg, "scan %s base=%p real=%p", dllname, base, real);
-            logmsg(dbg);
-        }
         for (i = 0; thunk[i]; i++) {
-            if (verbose) {
-                wsprintfA(dbg, "  thunk[%u]=%p", i,
-                          (void *)(UINT_PTR)thunk[i]);
-                logmsg(dbg);
-            }
             if (thunk[i] == (DWORD)(UINT_PTR)real) {
                 DWORD old;
                 VirtualProtect(&thunk[i], sizeof(DWORD),
@@ -249,16 +281,18 @@ static void hook_iat(void)
     HANDLE snap;
     MODULEENTRY32 me;
     HMODULE gdi, u32;
-    FARPROC realBitBlt, realS2C, realSCP;
+    FARPROC realBitBlt, realS2C, realSCP, realGCP;
 
     gdi = GetModuleHandleA("GDI32.dll");
     u32 = GetModuleHandleA("USER32.dll");
     realBitBlt = gdi ? GetProcAddress(gdi, "BitBlt") : NULL;
     realS2C = u32 ? GetProcAddress(u32, "ScreenToClient") : NULL;
     realSCP = u32 ? GetProcAddress(u32, "SetCursorPos") : NULL;
+    realGCP = u32 ? GetProcAddress(u32, "GetCursorPos") : NULL;
     if (realBitBlt) g_origBitBlt = (PFN_BitBlt)realBitBlt;
     if (realS2C) g_origScreenToClient = (PFN_ScreenToClient)realS2C;
     if (realSCP) g_origSetCursorPos = (PFN_SetCursorPos)realSCP;
+    if (realGCP) g_origGetCursorPos = (PFN_GetCursorPos)realGCP;
     if (u32)
         g_origClientToScreen =
             (PFN_ClientToScreen)GetProcAddress(u32, "ClientToScreen");
@@ -272,6 +306,8 @@ static void hook_iat(void)
                     ScreenToClient_Hook, "ScreenToClient IAT hooked");
         hook_module(GetModuleHandleA(NULL), "USER32.dll", realSCP,
                     SetCursorPos_Hook, "SetCursorPos IAT hooked");
+        hook_module(GetModuleHandleA(NULL), "USER32.dll", realGCP,
+                    GetCursorPos_Hook, "GetCursorPos IAT hooked");
         return;
     }
     me.dwSize = sizeof(me);
@@ -286,6 +322,9 @@ static void hook_iat(void)
             if (realSCP)
                 hook_module(me.hModule, "USER32.dll", realSCP,
                             SetCursorPos_Hook, "SetCursorPos IAT hooked");
+            if (realGCP)
+                hook_module(me.hModule, "USER32.dll", realGCP,
+                            GetCursorPos_Hook, "GetCursorPos IAT hooked");
         } while (Module32Next(snap, &me));
     }
     CloseHandle(snap);
