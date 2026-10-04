@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build proxy DLL and installer
+        run: src\proxy\package.bat
+        shell: cmd
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SengokuRance_MultiResPatch_Setup.exe
+            dist/SengokuRance_MultiResPatch.zip
+          generate_release_notes: true

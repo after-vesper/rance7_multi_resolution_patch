@@ -11,7 +11,11 @@ rem --- installer (embeds the freshly built files) ---
 python ..\installer\gen_assets.py ..\installer\embedded_assets.inc || exit /b 1
 
 set SDK=C:\Program Files (x86)\Windows Kits\10
-set VER=10.0.26100.0
+set VER=
+for /f "delims=" %%v in ('dir /b /ad /o-n "%SDK%\Include\10.0.*" 2^>nul') do (
+    if not defined VER set VER=%%v
+)
+if not defined VER (echo Windows SDK 10 not found & exit /b 1)
 set INC=-I"%SDK%\Include\%VER%\um" -I"%SDK%\Include\%VER%\shared" -I"%SDK%\Include\%VER%\ucrt" -I..\installer
 set LIB=/libpath:"%SDK%\Lib\%VER%\um\x86" /libpath:"%SDK%\Lib\%VER%\ucrt\x86"
 
