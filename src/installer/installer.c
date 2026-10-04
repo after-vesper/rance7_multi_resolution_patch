@@ -9,7 +9,6 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <shlobj.h>
 
 #define APPID "3867170"
 #define GAME_EXE "Rance7.exe"
@@ -222,8 +221,6 @@ static int detect_game_dir(char *out, DWORD cap)
     return found;
 }
 
-/* --- folder picker ------------------------------------------------------- */
-
 /* UI text uses the wide APIs: the source file is UTF-8 and the A
    functions would decode the literals as the system ANSI codepage,
    producing mojibake. */
@@ -231,37 +228,6 @@ static void to_wide(const char *src, WCHAR *dst, DWORD cap)
 {
     if (!MultiByteToWideChar(CP_ACP, 0, src, -1, dst, cap))
         dst[0] = 0;
-}
-
-static int CALLBACK browse_cb(HWND hwnd, UINT msg, LPARAM lp, LPARAM data)
-{
-    (void)lp;
-    if (msg == BFFM_INITIALIZED)
-        SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, data);
-    return 0;
-}
-
-static int browse_dir(char *out, DWORD cap)
-{
-    BROWSEINFOW bi;
-    LPITEMIDLIST pidl;
-    zero(&bi, sizeof(bi));
-    bi.lpszTitle =
-        L"Select the game folder containing Rance7.exe / "
-        L"Rance7.exe があるフォルダを選択してください";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    bi.lpfn = browse_cb;
-    bi.lParam = (LPARAM)out;
-    CoInitialize(NULL);
-    pidl = SHBrowseForFolderW(&bi);
-    if (pidl && SHGetPathFromIDListA(pidl, out)) {
-        CoTaskMemFree(pidl);
-        CoUninitialize();
-        return 1;
-    }
-    CoUninitialize();
-    (void)cap;
-    return 0;
 }
 
 /* --- install ------------------------------------------------------------- */
@@ -290,33 +256,23 @@ int mainCRTStartup(void)
 
     dir[0] = 0;
     detected = detect_game_dir(dir, sizeof(dir));
-    if (detected) {
-        to_wide(dir, wdir, MAX_PATH);
-        wsprintfW(msg,
-                  L"Game found:\n%s\n\nInstall the patch to this "
-                  L"folder?\n\nこのフォルダにパッチを適用しますか?",
-                  wdir);
-        if (MessageBoxW(NULL, msg, L"Sengoku Rance Multi-Res Patch",
-                        MB_YESNO | MB_ICONQUESTION) != IDYES)
-            dir[0] = 0;
-        else if (!file_exists(dir, GAME_EXE))
-            dir[0] = 0;
+    if (!detected || !file_exists(dir, GAME_EXE)) {
+        MessageBoxW(NULL,
+                    L"The game folder was not found.\n"
+                    L"ゲームフォルダが見つかりませんでした。\n\n"
+                    L"Install via Steam and run this installer again.",
+                    L"Sengoku Rance Multi-Res Patch",
+                    MB_ICONWARNING);
+        return 1;
     }
-    while (!dir[0]) {
-        dir[0] = 0;
-        if (!browse_dir(dir, sizeof(dir)))
-            return 0; /* cancelled */
-        if (!file_exists(dir, GAME_EXE)) {
-            if (MessageBoxW(NULL,
-                            L"Rance7.exe was not found in the selected "
-                            L"folder.\n選択したフォルダに Rance7.exe "
-                            L"が見つかりません。\n\nChoose again?",
-                            L"Sengoku Rance Multi-Res Patch",
-                            MB_YESNO | MB_ICONWARNING) != IDYES)
-                return 0;
-            dir[0] = 0;
-        }
-    }
+    to_wide(dir, wdir, MAX_PATH);
+    wsprintfW(msg,
+              L"Game found:\n%s\n\nInstall the patch to this "
+              L"folder?\n\nこのフォルダにパッチを適用しますか?",
+              wdir);
+    if (MessageBoxW(NULL, msg, L"Sengoku Rance Multi-Res Patch",
+                    MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return 0; /* cancelled */
 
     /* Back up a pre-existing dinput.dll (other mod or the real
        proxy) before overwriting. */

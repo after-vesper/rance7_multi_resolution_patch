@@ -16,7 +16,7 @@ set INC=-I"%SDK%\Include\%VER%\um" -I"%SDK%\Include\%VER%\shared" -I"%SDK%\Inclu
 set LIB=/libpath:"%SDK%\Lib\%VER%\um\x86" /libpath:"%SDK%\Lib\%VER%\ucrt\x86"
 
 clang --target=i686-pc-windows-msvc -O2 -fno-stack-protector -mno-stack-arg-probe %INC% -c ..\installer\installer.c -o ..\installer\installer.obj || exit /b 1
-lld-link -subsystem:console -manifest:embed "-manifestuac:level='requireAdministrator' uiAccess='false'" -out:..\..\dist\SengokuRance_MultiResPatch_Setup.exe -entry:mainCRTStartup -nodefaultlib %LIB% ..\installer\installer.obj kernel32.lib user32.lib shell32.lib ole32.lib advapi32.lib || exit /b 1
+lld-link -subsystem:windows -manifest:embed "-manifestuac:level='requireAdministrator' uiAccess='false'" -out:..\..\dist\SengokuRance_MultiResPatch_Setup.exe -entry:mainCRTStartup -nodefaultlib %LIB% ..\installer\installer.obj kernel32.lib user32.lib advapi32.lib || exit /b 1
 echo Built installer
 
 rem --- manual-install package ---
