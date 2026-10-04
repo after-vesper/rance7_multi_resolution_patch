@@ -156,18 +156,21 @@ static int native_fullscreen(void)
 static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (g_enabled) {
-        /* Our own borderless menu entry toggles the mode both ways. */
-        if (msg == WM_COMMAND && LOWORD(wp) == CMD_BORDERLESS &&
-            !native_fullscreen()) {
-            g_full = !g_full;
-            ensure_window_size();
-            return 0;
-        }
-        /* Alt+B toggles borderless as well; this is also the way back
-           to windowed mode while borderless (the menu is hidden). */
-        if (msg == WM_SYSKEYDOWN && wp == 'B' &&
-            !native_fullscreen()) {
-            g_full = !g_full;
+        /* Our own borderless menu entry / Alt+B toggles the mode both
+           ways. Alt+B is also the way back while borderless (the menu
+           is hidden there). */
+        if ((msg == WM_COMMAND && LOWORD(wp) == CMD_BORDERLESS) ||
+            (msg == WM_SYSKEYDOWN && wp == 'B')) {
+            if (native_fullscreen()) {
+                /* Leave the engine's fullscreen first (its toggle is
+                   command 127), then enter borderless. g_full is set
+                   rather than toggled so the modes stay exclusive. */
+                CallWindowProcA(g_origWndProc, hwnd, WM_COMMAND,
+                                127, 0);
+                g_full = 1;
+            } else {
+                g_full = !g_full;
+            }
             ensure_window_size();
             return 0;
         }
