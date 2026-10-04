@@ -25,7 +25,7 @@
 
 static HMODULE g_dinput;
 static int g_enabled;
-static int g_outW, g_outH, g_smooth, g_mode;
+static int g_outW, g_outH, g_smooth, g_mode, g_full;
 static HWND g_hwnd;
 static int g_hooked;
 
@@ -63,7 +63,8 @@ static void load_config(void)
     g_outH = GetPrivateProfileIntA("Display", "Height", GAME_H, path);
     g_smooth = GetPrivateProfileIntA("Display", "Filter", 1, path);
     g_mode = GetPrivateProfileIntA("Display", "ScaleMode", 1, path);
-    g_enabled = g_outW > GAME_W && g_outH > GAME_H;
+    g_full = GetPrivateProfileIntA("Display", "Fullscreen", 0, path);
+    g_enabled = g_full || (g_outW > GAME_W && g_outH > GAME_H);
 }
 
 /* --- window management -------------------------------------------------- */
@@ -119,6 +120,8 @@ static void get_viewport(RECT *vp)
     vp->bottom = vp->top + h;
 }
 
+static void ensure_window_size(void);
+
 /* Subclass the game window so mouse-message client coords arrive in the
    800x600 logical space. Without this the game reads raw client coords
    (e.g. as the start point of cursor warps), mixing coordinate spaces. */
@@ -127,6 +130,13 @@ static WNDPROC g_origWndProc;
 static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (g_enabled) {
+        /* Alt+Enter toggles borderless fullscreen at runtime. */
+        if (msg == WM_SYSKEYDOWN && wp == VK_RETURN &&
+            (lp & (1 << 29))) {
+            g_full = !g_full;
+            ensure_window_size();
+            return 0;
+        }
         switch (msg) {
         case WM_MOUSEMOVE:
         case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
@@ -151,10 +161,63 @@ static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return CallWindowProcA(g_origWndProc, hwnd, msg, wp, lp);
 }
 
+/* Borderless fullscreen: strip the frame and cover the monitor. The
+   viewport logic still applies, so a 16:9 monitor gets pillarboxed
+   4:3 output. Original style/menu are saved for restore on toggle. */
+static LONG g_savedStyle = -1;
+static HMENU g_savedMenu;
+static RECT g_savedRect;
+
+static void apply_fullscreen_state(void)
+{
+    LONG st;
+    RECT rc, mon;
+    MONITORINFO mi;
+    HMONITOR hm;
+    if (!g_hwnd)
+        return;
+    if (g_full) {
+        hm = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoA(hm, &mi);
+        mon = mi.rcMonitor;
+        st = GetWindowLongA(g_hwnd, GWL_STYLE);
+        if (st & WS_CAPTION) {
+            g_savedStyle = st;
+            g_savedMenu = GetMenu(g_hwnd);
+            GetWindowRect(g_hwnd, &g_savedRect);
+            SetWindowLongA(g_hwnd, GWL_STYLE,
+                           (st & ~(WS_CAPTION | WS_THICKFRAME |
+                                   WS_SYSMENU | WS_MINIMIZEBOX |
+                                   WS_MAXIMIZEBOX)) | WS_POPUP);
+            if (g_savedMenu)
+                SetMenu(g_hwnd, NULL);
+        }
+        GetWindowRect(g_hwnd, &rc);
+        if (rc.left != mon.left || rc.top != mon.top ||
+            rc.right != mon.right || rc.bottom != mon.bottom)
+            SetWindowPos(g_hwnd, HWND_TOP, mon.left, mon.top,
+                         mon.right - mon.left, mon.bottom - mon.top,
+                         SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    } else if (g_savedStyle != -1) {
+        SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle);
+        if (g_savedMenu)
+            SetMenu(g_hwnd, g_savedMenu);
+        SetWindowPos(g_hwnd, NULL, g_savedRect.left, g_savedRect.top,
+                     g_savedRect.right - g_savedRect.left,
+                     g_savedRect.bottom - g_savedRect.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        g_savedStyle = -1;
+    }
+}
+
 static void ensure_window_size(void)
 {
     RECT rc;
     if (!g_hwnd)
+        return;
+    apply_fullscreen_state();
+    if (g_full)
         return;
     GetClientRect(g_hwnd, &rc);
     if (rc.right == g_outW && rc.bottom == g_outH)
@@ -207,30 +270,23 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
             get_viewport(&vp);
             /* Mirror the update into the logical back buffer. */
             g_origBitBlt(g_backDC, x, y, cx, cy, src, sx, sy, rop);
-            /* Paint the letterbox/pillarbox bars only when the viewport
-               geometry changes; repainting every frame flickers at the
-               bar edges. */
+            /* Paint the letterbox/pillarbox bars black. The class
+               background brush can erase them, so repaint each frame. */
             {
-                static RECT painted;
                 RECT rc;
                 GetClientRect(w, &rc);
-                if (rc.left != painted.left || rc.top != painted.top ||
-                    rc.right != painted.right ||
-                    rc.bottom != painted.bottom) {
-                    painted = rc;
-                    if (vp.left > 0)
-                        PatBlt(dst, 0, 0, vp.left, rc.bottom, BLACKNESS);
-                    if (vp.right < rc.right)
-                        PatBlt(dst, vp.right, 0, rc.right - vp.right,
-                               rc.bottom, BLACKNESS);
-                    if (vp.top > 0)
-                        PatBlt(dst, vp.left, 0, vp.right - vp.left,
-                               vp.top, BLACKNESS);
-                    if (vp.bottom < rc.bottom)
-                        PatBlt(dst, vp.left, vp.bottom,
-                               vp.right - vp.left,
-                               rc.bottom - vp.bottom, BLACKNESS);
-                }
+                if (vp.left > 0)
+                    PatBlt(dst, 0, 0, vp.left, rc.bottom, BLACKNESS);
+                if (vp.right < rc.right)
+                    PatBlt(dst, vp.right, 0, rc.right - vp.right,
+                           rc.bottom, BLACKNESS);
+                if (vp.top > 0)
+                    PatBlt(dst, vp.left, 0, vp.right - vp.left,
+                           vp.top, BLACKNESS);
+                if (vp.bottom < rc.bottom)
+                    PatBlt(dst, vp.left, vp.bottom,
+                           vp.right - vp.left,
+                           rc.bottom - vp.bottom, BLACKNESS);
             }
             SetStretchBltMode(dst, g_smooth ? HALFTONE : COLORONCOLOR);
             if (g_smooth)
