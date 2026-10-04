@@ -258,17 +258,16 @@ int mainCRTStartup(void)
     detected = detect_game_dir(dir, sizeof(dir));
     if (!detected || !file_exists(dir, GAME_EXE)) {
         MessageBoxW(NULL,
-                    L"The game folder was not found.\n"
                     L"ゲームフォルダが見つかりませんでした。\n\n"
-                    L"Install via Steam and run this installer again.",
+                    L"Steam でインストールしてから再度実行してください。",
                     L"Sengoku Rance Multi-Res Patch",
                     MB_ICONWARNING);
         return 1;
     }
     to_wide(dir, wdir, MAX_PATH);
     wsprintfW(msg,
-              L"Game found:\n%s\n\nInstall the patch to this "
-              L"folder?\n\nこのフォルダにパッチを適用しますか?",
+              L"ゲームが見つかりました:\n%s\n\n"
+              L"このフォルダにパッチを適用しますか?",
               wdir);
     if (MessageBoxW(NULL, msg, L"Sengoku Rance Multi-Res Patch",
                     MB_YESNO | MB_ICONQUESTION) != IDYES)
@@ -294,18 +293,19 @@ int mainCRTStartup(void)
             WCHAR wname[64];
             to_wide(FILES[i].name, wname, 64);
             to_wide(fp, wdir, MAX_PATH);
-            wsprintfW(msg, L"Failed to write %s\n%s", wname, wdir);
-            MessageBoxW(NULL, msg, L"Install failed", MB_ICONERROR);
+            wsprintfW(msg, L"%s の書き込みに失敗しました\n%s",
+                      wname, wdir);
+            MessageBoxW(NULL, msg,
+                        L"Sengoku Rance Multi-Res Patch",
+                        MB_ICONERROR);
             return 1;
         }
     }
 
     to_wide(dir, wdir, MAX_PATH);
     wsprintfW(msg,
-              L"Patch installed to:\n%s\n\n"
-              L"Uninstall: delete dinput.dll and MultiRes.ini in that "
-              L"folder.\n\nパッチをインストールしました。\n"
-              L"アンインストール: フォルダ内の dinput.dll と "
+              L"パッチをインストールしました:\n%s\n\n"
+              L"アンインストールするには、フォルダ内の dinput.dll と "
               L"MultiRes.ini を削除してください。",
               wdir);
     MessageBoxW(NULL, msg, L"Sengoku Rance Multi-Res Patch",
