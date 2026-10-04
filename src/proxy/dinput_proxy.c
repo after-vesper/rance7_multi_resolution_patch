@@ -127,34 +127,52 @@ static void ensure_window_size(void);
    (e.g. as the start point of cursor warps), mixing coordinate spaces. */
 static WNDPROC g_origWndProc;
 
-/* True when the engine entered its own fullscreen (popup window) that
-   we did not request. In that state every hook must pass through so the
-   native path renders undisturbed. */
+/* Menu command id used for our borderless fullscreen entry, appended
+   to the System submenu. Chosen high to avoid colliding with the
+   game's own command ids (they reach ~40100). */
+#define CMD_BORDERLESS 40200
+
+/* True when the engine entered its own fullscreen (it strips the
+   caption and switches the display mode to 800x600) that we did not
+   request. In that state every hook must pass through so the native
+   path renders undisturbed. */
 static int native_fullscreen(void)
 {
     return g_hwnd && !g_full &&
-           (GetWindowLongA(g_hwnd, GWL_STYLE) & WS_POPUP) != 0;
+           !(GetWindowLongA(g_hwnd, GWL_STYLE) & WS_CAPTION);
 }
 
 static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (g_enabled) {
+        /* Our own borderless menu entry toggles the mode both ways. */
+        if (msg == WM_COMMAND && LOWORD(wp) == CMD_BORDERLESS &&
+            !native_fullscreen()) {
+            g_full = !g_full;
+            ensure_window_size();
+            return 0;
+        }
+        /* Alt+B toggles borderless as well; this is also the way back
+           to windowed mode while borderless (the menu is hidden). */
+        if (msg == WM_SYSKEYDOWN && wp == 'B' &&
+            !native_fullscreen()) {
+            g_full = !g_full;
+            ensure_window_size();
+            return 0;
+        }
+        /* Inside borderless mode the game's fullscreen accelerator
+           (Alt+Enter -> command 127) would stack a native fullscreen
+           on top of ours. Treat it as "leave borderless" instead. */
+        if (g_full &&
+            ((msg == WM_COMMAND && LOWORD(wp) == 127) ||
+             (msg == WM_SYSKEYDOWN && wp == VK_RETURN &&
+              (lp & (1 << 29))))) {
+            g_full = 0;
+            ensure_window_size();
+            return 0;
+        }
+    }
     if (g_enabled && !native_fullscreen()) {
-        /* Alt+Enter toggles borderless fullscreen at runtime. */
-        if (msg == WM_SYSKEYDOWN && wp == VK_RETURN &&
-            (lp & (1 << 29))) {
-            g_full = !g_full;
-            ensure_window_size();
-            return 0;
-        }
-        /* The System menu's own "fullscreen" command (id 127) enters
-           the engine's exclusive fullscreen path, which conflicts with
-           this scaler. Redirect it to our borderless fullscreen so the
-           menu item and Alt+Enter behave identically. */
-        if (msg == WM_COMMAND && LOWORD(wp) == 127) {
-            g_full = !g_full;
-            ensure_window_size();
-            return 0;
-        }
         switch (msg) {
         case WM_MOUSEMOVE:
         case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
@@ -280,9 +298,23 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
         w = WindowFromDC(dst);
         if (w && g_hwnd && w == g_hwnd && !native_fullscreen()) {
             RECT vp;
-            if (!g_origWndProc)
+            if (!g_origWndProc) {
+                HMENU m, sys;
                 g_origWndProc = (WNDPROC)SetWindowLongPtrA(
                     g_hwnd, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
+                /* Append our borderless entry to the System submenu
+                   (first menu). The game's own fullscreen stays as is. */
+                m = GetMenu(g_hwnd);
+                sys = m ? GetSubMenu(m, 0) : NULL;
+                if (sys &&
+                    GetMenuState(sys, CMD_BORDERLESS, MF_BYCOMMAND)
+                        == (UINT)-1) {
+                    AppendMenuW(sys, MF_SEPARATOR, 0, NULL);
+                    AppendMenuW(sys, MF_STRING, CMD_BORDERLESS,
+                                L"\x30DC\x30FC\x30C0\x30FC\x30EC\x30B9"
+                                L"\x5168\x753B\x9762(&B)");
+                }
+            }
             ensure_window_size();
             ensure_backbuffer(dst);
             get_viewport(&vp);
