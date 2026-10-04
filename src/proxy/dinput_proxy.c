@@ -28,6 +28,8 @@ static int g_enabled;
 static int g_outW, g_outH, g_smooth, g_mode, g_full;
 static HWND g_hwnd;
 static int g_hooked;
+static int g_borderless_applied;
+static int g_appliedW, g_appliedH;
 
 typedef BOOL (WINAPI *PFN_BitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
 typedef BOOL (WINAPI *PFN_ScreenToClient)(HWND, LPPOINT);
@@ -132,14 +134,23 @@ static WNDPROC g_origWndProc;
    game's own command ids (they reach ~40100). */
 #define CMD_BORDERLESS 40200
 
-/* True when the engine entered its own fullscreen (it strips the
-   caption and switches the display mode to 800x600) that we did not
-   request. In that state every hook must pass through so the native
-   path renders undisturbed. */
+/* True when the engine's own exclusive fullscreen is active and we
+   did not apply the borderless style. The engine strips the caption
+   and shrinks the window to the 800x600 display mode it sets; a mere
+   caption-less window sized like a monitor (e.g. the state the engine
+   restores after leaving fullscreen while we were borderless) is not
+   native fullscreen. While native is active every hook passes
+   through so the engine renders undisturbed. */
 static int native_fullscreen(void)
 {
-    return g_hwnd && !g_full &&
-           !(GetWindowLongA(g_hwnd, GWL_STYLE) & WS_CAPTION);
+    RECT r;
+    if (!g_hwnd || g_borderless_applied)
+        return 0;
+    if (GetWindowLongA(g_hwnd, GWL_STYLE) & WS_CAPTION)
+        return 0;
+    GetWindowRect(g_hwnd, &r);
+    return r.left <= 0 && r.top <= 0 &&
+           r.right - r.left <= 1024 && r.bottom - r.top <= 768;
 }
 
 static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -161,8 +172,10 @@ static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         /* Inside borderless mode the game's fullscreen accelerator
-           (Alt+Enter -> command 127) would stack a native fullscreen
-           on top of ours. Treat it as "leave borderless" instead. */
+           (Alt+Enter -> command 127) is interpreted as leaving
+           borderless. If the engine still engages its native
+           fullscreen through a non-message path, the WM_SIZE check
+           below yields control so the two never stack. */
         if (g_full &&
             ((msg == WM_COMMAND && LOWORD(wp) == 127) ||
              (msg == WM_SYSKEYDOWN && wp == VK_RETURN &&
@@ -170,6 +183,16 @@ static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_full = 0;
             ensure_window_size();
             return 0;
+        }
+        /* Native fullscreen taking over while we were borderless:
+           the engine resizes the window to its 800x600 mode. Release
+           our borderless state so only native fullscreen is active;
+           the saved windowed style is restored when it exits. */
+        if (msg == WM_SIZE && g_borderless_applied &&
+            (LOWORD(lp) != (WORD)g_appliedW ||
+             HIWORD(lp) != (WORD)g_appliedH)) {
+            g_full = 0;
+            g_borderless_applied = 0;
         }
     }
     if (g_enabled && !native_fullscreen()) {
@@ -235,6 +258,9 @@ static void apply_fullscreen_state(void)
             SetWindowPos(g_hwnd, HWND_TOP, mon.left, mon.top,
                          mon.right - mon.left, mon.bottom - mon.top,
                          SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        g_borderless_applied = 1;
+        g_appliedW = mon.right - mon.left;
+        g_appliedH = mon.bottom - mon.top;
     } else if (g_savedStyle != -1) {
         SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle);
         if (g_savedMenu)
@@ -244,6 +270,7 @@ static void apply_fullscreen_state(void)
                      g_savedRect.bottom - g_savedRect.top,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         g_savedStyle = -1;
+        g_borderless_applied = 0;
     }
 }
 
@@ -302,17 +329,19 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
                 HMENU m, sys;
                 g_origWndProc = (WNDPROC)SetWindowLongPtrA(
                     g_hwnd, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
-                /* Append our borderless entry to the System submenu
-                   (first menu). The game's own fullscreen stays as is. */
+                /* Insert our borderless entry right under the game's
+                   own fullscreen item in the System submenu, using
+                   half-width katakana to match its style. */
                 m = GetMenu(g_hwnd);
                 sys = m ? GetSubMenu(m, 0) : NULL;
                 if (sys &&
                     GetMenuState(sys, CMD_BORDERLESS, MF_BYCOMMAND)
                         == (UINT)-1) {
-                    AppendMenuW(sys, MF_SEPARATOR, 0, NULL);
-                    AppendMenuW(sys, MF_STRING, CMD_BORDERLESS,
-                                L"\x30DC\x30FC\x30C0\x30FC\x30EC\x30B9"
-                                L"\x5168\x753B\x9762(&B)");
+                    InsertMenuW(sys, 1, MF_BYPOSITION | MF_STRING,
+                                CMD_BORDERLESS,
+                                L"\xFF8E\xFF9E\xFF70\xFF80\xFF9E\xFF70"
+                                L"\xFF9A\xFF7D\xFF8C\xFF99\xFF7D\xFF78"
+                                L"\xFF98\xFF70\xFF9D(&B)      Alt+B");
                 }
             }
             ensure_window_size();
