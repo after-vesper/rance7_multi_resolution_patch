@@ -328,8 +328,28 @@ static void ensure_window_size(void)
     AdjustWindowRectEx(&rc, GetWindowLongA(g_hwnd, GWL_STYLE),
                        GetMenu(g_hwnd) != NULL,
                        GetWindowLongA(g_hwnd, GWL_EXSTYLE));
-    SetWindowPos(g_hwnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    /* The game centers the small 800x600 window at startup, so growing
+       it with SWP_NOMOVE would leave it shifted toward the bottom
+       right. Recenter the resized window on its monitor's work area
+       instead. */
+    {
+        HMONITOR hm = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi;
+        RECT wa;
+        int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoA(hm, &mi);
+        wa = mi.rcWork;
+        /* If the window does not fit the work area, clamp to the
+           monitor rect. */
+        if (ww > wa.right - wa.left || wh > wa.bottom - wa.top)
+            wa = mi.rcMonitor;
+        SetWindowPos(g_hwnd, NULL,
+                     wa.left + (wa.right - wa.left - ww) / 2,
+                     wa.top + (wa.bottom - wa.top - wh) / 2,
+                     ww, wh,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 }
 
 /* --- resolution picker dialog ------------------------------------------- */
