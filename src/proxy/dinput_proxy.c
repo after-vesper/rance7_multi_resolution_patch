@@ -28,6 +28,8 @@ static int g_enabled;
 static int g_outW, g_outH, g_smooth, g_mode, g_full;
 static HWND g_hwnd;
 static int g_hooked;
+static int g_borderless_applied;
+static int g_appliedW, g_appliedH;
 
 typedef BOOL (WINAPI *PFN_BitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
 typedef BOOL (WINAPI *PFN_ScreenToClient)(HWND, LPPOINT);
@@ -127,16 +129,76 @@ static void ensure_window_size(void);
    (e.g. as the start point of cursor warps), mixing coordinate spaces. */
 static WNDPROC g_origWndProc;
 
+/* Menu command id used for our borderless fullscreen entry, appended
+   to the System submenu. Chosen high to avoid colliding with the
+   game's own command ids (they reach ~40100). */
+#define CMD_BORDERLESS 40200
+
+/* True when the engine's own exclusive fullscreen is active and we
+   did not apply the borderless style. The engine strips the caption
+   and shrinks the window to the 800x600 display mode it sets; a mere
+   caption-less window sized like a monitor (e.g. the state the engine
+   restores after leaving fullscreen while we were borderless) is not
+   native fullscreen. While native is active every hook passes
+   through so the engine renders undisturbed. */
+static int native_fullscreen(void)
+{
+    RECT r;
+    if (!g_hwnd || g_borderless_applied)
+        return 0;
+    if (GetWindowLongA(g_hwnd, GWL_STYLE) & WS_CAPTION)
+        return 0;
+    GetWindowRect(g_hwnd, &r);
+    return r.left <= 0 && r.top <= 0 &&
+           r.right - r.left <= 1024 && r.bottom - r.top <= 768;
+}
+
 static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (g_enabled) {
-        /* Alt+Enter toggles borderless fullscreen at runtime. */
-        if (msg == WM_SYSKEYDOWN && wp == VK_RETURN &&
-            (lp & (1 << 29))) {
-            g_full = !g_full;
+        /* Our own borderless menu entry / Alt+B toggles the mode both
+           ways. Alt+B is also the way back while borderless (the menu
+           is hidden there). */
+        if ((msg == WM_COMMAND && LOWORD(wp) == CMD_BORDERLESS) ||
+            (msg == WM_SYSKEYDOWN && wp == 'B')) {
+            if (native_fullscreen()) {
+                /* Leave the engine's fullscreen first (its toggle is
+                   command 127), then enter borderless. g_full is set
+                   rather than toggled so the modes stay exclusive. */
+                CallWindowProcA(g_origWndProc, hwnd, WM_COMMAND,
+                                127, 0);
+                g_full = 1;
+            } else {
+                g_full = !g_full;
+            }
             ensure_window_size();
             return 0;
         }
+        /* Inside borderless mode the game's fullscreen accelerator
+           (Alt+Enter -> command 127) is interpreted as leaving
+           borderless. If the engine still engages its native
+           fullscreen through a non-message path, the WM_SIZE check
+           below yields control so the two never stack. */
+        if (g_full &&
+            ((msg == WM_COMMAND && LOWORD(wp) == 127) ||
+             (msg == WM_SYSKEYDOWN && wp == VK_RETURN &&
+              (lp & (1 << 29))))) {
+            g_full = 0;
+            ensure_window_size();
+            return 0;
+        }
+        /* Native fullscreen taking over while we were borderless:
+           the engine resizes the window to its 800x600 mode. Release
+           our borderless state so only native fullscreen is active;
+           the saved windowed style is restored when it exits. */
+        if (msg == WM_SIZE && g_borderless_applied &&
+            (LOWORD(lp) != (WORD)g_appliedW ||
+             HIWORD(lp) != (WORD)g_appliedH)) {
+            g_full = 0;
+            g_borderless_applied = 0;
+        }
+    }
+    if (g_enabled && !native_fullscreen()) {
         switch (msg) {
         case WM_MOUSEMOVE:
         case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
@@ -199,6 +261,9 @@ static void apply_fullscreen_state(void)
             SetWindowPos(g_hwnd, HWND_TOP, mon.left, mon.top,
                          mon.right - mon.left, mon.bottom - mon.top,
                          SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        g_borderless_applied = 1;
+        g_appliedW = mon.right - mon.left;
+        g_appliedH = mon.bottom - mon.top;
     } else if (g_savedStyle != -1) {
         SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle);
         if (g_savedMenu)
@@ -208,6 +273,7 @@ static void apply_fullscreen_state(void)
                      g_savedRect.bottom - g_savedRect.top,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         g_savedStyle = -1;
+        g_borderless_applied = 0;
     }
 }
 
@@ -260,11 +326,27 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
         if (!g_hwnd)
             EnumWindows(find_game_window, (LPARAM)&g_hwnd);
         w = WindowFromDC(dst);
-        if (w && g_hwnd && w == g_hwnd) {
+        if (w && g_hwnd && w == g_hwnd && !native_fullscreen()) {
             RECT vp;
-            if (!g_origWndProc)
+            if (!g_origWndProc) {
+                HMENU m, sys;
                 g_origWndProc = (WNDPROC)SetWindowLongPtrA(
                     g_hwnd, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
+                /* Insert our borderless entry right under the game's
+                   own fullscreen item in the System submenu, using
+                   half-width katakana to match its style. */
+                m = GetMenu(g_hwnd);
+                sys = m ? GetSubMenu(m, 0) : NULL;
+                if (sys &&
+                    GetMenuState(sys, CMD_BORDERLESS, MF_BYCOMMAND)
+                        == (UINT)-1) {
+                    InsertMenuW(sys, 1, MF_BYPOSITION | MF_STRING,
+                                CMD_BORDERLESS,
+                                L"\xFF8E\xFF9E\xFF70\xFF80\xFF9E\xFF70"
+                                L"\xFF9A\xFF7D\xFF8C\xFF99\xFF7D\xFF78"
+                                L"\xFF98\xFF70\xFF9D(&B)      Alt+B");
+                }
+            }
             ensure_window_size();
             ensure_backbuffer(dst);
             get_viewport(&vp);
@@ -318,7 +400,7 @@ static BOOL WINAPI ScreenToClient_Hook(HWND hwnd, LPPOINT pt)
    the game window to the scaled position. */
 static BOOL WINAPI SetCursorPos_Hook(int x, int y)
 {
-    if (g_enabled && g_hwnd) {
+    if (g_enabled && g_hwnd && !native_fullscreen()) {
         POINT pt;
         pt.x = x;
         pt.y = y;
@@ -344,7 +426,7 @@ static BOOL WINAPI SetCursorPos_Hook(int x, int y)
 static BOOL WINAPI GetCursorPos_Hook(LPPOINT pt)
 {
     BOOL r = g_origGetCursorPos(pt);
-    if (r && g_enabled && g_hwnd) {
+    if (r && g_enabled && g_hwnd && !native_fullscreen()) {
         RECT vp;
         POINT c = *pt;
         g_origScreenToClient(g_hwnd, &c);
@@ -519,6 +601,14 @@ BOOL WINAPI DllMainCRTStartup(HINSTANCE inst, DWORD reason, void *res)
 {
     (void)inst; (void)res;
     if (reason == DLL_PROCESS_ATTACH) {
+        /* The game is DPI-unaware. On high-DPI monitors (e.g. 4K at
+           150%) Windows would bitmap-scale the whole window, blurring
+           the output. Declare per-monitor awareness early so monitor
+           rects and window metrics are real pixels and our scaler
+           renders at true output resolution. */
+        if (!SetProcessDpiAwarenessContext(
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+            SetProcessDPIAware();
         logmsg("dinput proxy loaded");
         if (!g_hooked) {
             g_hooked = 1;
