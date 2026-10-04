@@ -13,6 +13,8 @@
  *   Width  = 1600
  *   Height = 1200
  *   Filter = 1    ; 0 = nearest (COLORONCOLOR), 1 = smooth (HALFTONE)
+ *   ScaleMode = 1 ; 0 = stretch, 1 = keep 4:3 (fractional scale),
+ *                 ; 2 = largest integer scale (avoids jitter)
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -23,7 +25,7 @@
 
 static HMODULE g_dinput;
 static int g_enabled;
-static int g_outW, g_outH, g_smooth;
+static int g_outW, g_outH, g_smooth, g_mode;
 static HWND g_hwnd;
 static int g_hooked;
 
@@ -60,6 +62,7 @@ static void load_config(void)
     g_outW = GetPrivateProfileIntA("Display", "Width", GAME_W, path);
     g_outH = GetPrivateProfileIntA("Display", "Height", GAME_H, path);
     g_smooth = GetPrivateProfileIntA("Display", "Filter", 1, path);
+    g_mode = GetPrivateProfileIntA("Display", "ScaleMode", 1, path);
     g_enabled = g_outW > GAME_W && g_outH > GAME_H;
 }
 
@@ -80,6 +83,42 @@ static BOOL CALLBACK find_game_window(HWND hwnd, LPARAM lp)
     return TRUE;
 }
 
+/* Viewport: the rect inside the client area that receives the scaled
+   800x600 frame. ScaleMode: 0=stretch to client, 1=largest 4:3 rect
+   (fractional scale), 2=largest integer-scale 4:3 rect (no fraction
+   jitter but possibly small). All logical<->client conversions go
+   through this rect. */
+static void get_viewport(RECT *vp)
+{
+    RECT rc;
+    int w, h;
+    GetClientRect(g_hwnd, &rc);
+    if (g_mode == 0) {          /* stretch */
+        *vp = rc;
+        return;
+    }
+    if (g_mode == 2) {          /* integer scale */
+        int sx = rc.right / GAME_W;
+        int sy = rc.bottom / GAME_H;
+        int s = sx < sy ? sx : sy;
+        if (s < 1) s = 1;
+        w = GAME_W * s;
+        h = GAME_H * s;
+    } else if (rc.right * GAME_H > rc.bottom * GAME_W) {
+        /* client wider than 4:3: pillarbox */
+        h = rc.bottom;
+        w = MulDiv(rc.bottom, GAME_W, GAME_H);
+    } else {
+        /* client taller than 4:3: letterbox */
+        w = rc.right;
+        h = MulDiv(rc.right, GAME_H, GAME_W);
+    }
+    vp->left = (rc.right - w) / 2;
+    vp->top = (rc.bottom - h) / 2;
+    vp->right = vp->left + w;
+    vp->bottom = vp->top + h;
+}
+
 /* Subclass the game window so mouse-message client coords arrive in the
    800x600 logical space. Without this the game reads raw client coords
    (e.g. as the start point of cursor warps), mixing coordinate spaces. */
@@ -95,13 +134,13 @@ static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
         case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
         case WM_MOUSEHOVER: {
-            RECT rc;
+            RECT vp;
             short x, y;
-            GetClientRect(hwnd, &rc);
+            get_viewport(&vp);
             x = (short)LOWORD(lp);
             y = (short)HIWORD(lp);
-            x = (short)MulDiv(x, GAME_W, rc.right);
-            y = (short)MulDiv(y, GAME_H, rc.bottom);
+            x = (short)MulDiv(x - vp.left, GAME_W, vp.right - vp.left);
+            y = (short)MulDiv(y - vp.top, GAME_H, vp.bottom - vp.top);
             lp = MAKELPARAM((WORD)x, (WORD)y);
             break;
         }
@@ -132,6 +171,23 @@ static void ensure_window_size(void)
 
 /* --- BitBlt hook --------------------------------------------------------- */
 
+/* Logical 800x600 back buffer. Every game blit is mirrored into it at
+   1:1 (no rounding), then the whole buffer is presented to the window
+   with a single StretchBlt. This avoids seams between partial updates
+   that fractional dest-rect rounding would otherwise produce. */
+static HDC g_backDC;
+static HBITMAP g_backBmp;
+static HGDIOBJ g_backOld;
+
+static void ensure_backbuffer(HDC dst)
+{
+    if (g_backDC)
+        return;
+    g_backDC = CreateCompatibleDC(dst);
+    g_backBmp = CreateCompatibleBitmap(dst, GAME_W, GAME_H);
+    g_backOld = SelectObject(g_backDC, g_backBmp);
+}
+
 static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
                                HDC src, int sx, int sy, DWORD rop)
 {
@@ -142,24 +198,48 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
             EnumWindows(find_game_window, (LPARAM)&g_hwnd);
         w = WindowFromDC(dst);
         if (w && g_hwnd && w == g_hwnd) {
+            RECT vp;
             if (!g_origWndProc)
                 g_origWndProc = (WNDPROC)SetWindowLongPtrA(
                     g_hwnd, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
-            RECT rc;
-            int dx, dy, dw, dh;
             ensure_window_size();
-            GetClientRect(w, &rc);
-            /* Scale the partial-update rect proportionally so dirty-rect
-               blits land at the right place. */
-            dx = MulDiv(x, rc.right, GAME_W);
-            dy = MulDiv(y, rc.bottom, GAME_H);
-            dw = MulDiv(x + cx, rc.right, GAME_W) - dx;
-            dh = MulDiv(y + cy, rc.bottom, GAME_H) - dy;
+            ensure_backbuffer(dst);
+            get_viewport(&vp);
+            /* Mirror the update into the logical back buffer. */
+            g_origBitBlt(g_backDC, x, y, cx, cy, src, sx, sy, rop);
+            /* Paint the letterbox/pillarbox bars only when the viewport
+               geometry changes; repainting every frame flickers at the
+               bar edges. */
+            {
+                static RECT painted;
+                RECT rc;
+                GetClientRect(w, &rc);
+                if (rc.left != painted.left || rc.top != painted.top ||
+                    rc.right != painted.right ||
+                    rc.bottom != painted.bottom) {
+                    painted = rc;
+                    if (vp.left > 0)
+                        PatBlt(dst, 0, 0, vp.left, rc.bottom, BLACKNESS);
+                    if (vp.right < rc.right)
+                        PatBlt(dst, vp.right, 0, rc.right - vp.right,
+                               rc.bottom, BLACKNESS);
+                    if (vp.top > 0)
+                        PatBlt(dst, vp.left, 0, vp.right - vp.left,
+                               vp.top, BLACKNESS);
+                    if (vp.bottom < rc.bottom)
+                        PatBlt(dst, vp.left, vp.bottom,
+                               vp.right - vp.left,
+                               rc.bottom - vp.bottom, BLACKNESS);
+                }
+            }
             SetStretchBltMode(dst, g_smooth ? HALFTONE : COLORONCOLOR);
             if (g_smooth)
-                SetBrushOrgEx(dst, dx, dy, NULL);
-            return StretchBlt(dst, dx, dy, dw, dh,
-                              src, sx, sy, cx, cy, rop);
+                /* Keep a fixed halftone phase: per-blit origins shift
+                   the dither pattern and show up as shimmer. */
+                SetBrushOrgEx(dst, 0, 0, NULL);
+            return StretchBlt(dst, vp.left, vp.top,
+                              vp.right - vp.left, vp.bottom - vp.top,
+                              g_backDC, 0, 0, GAME_W, GAME_H, SRCCOPY);
         }
     }
     return g_origBitBlt(dst, x, y, cx, cy, src, sx, sy, rop);
@@ -188,14 +268,13 @@ static BOOL WINAPI SetCursorPos_Hook(int x, int y)
         pt.y = y;
         g_origScreenToClient(g_hwnd, &pt);
         {
-            /* The game emits warp targets in 800x600 logical space, but
-               glides interpolate from the real cursor position, so values
-               may exceed the logical range. Scale everything uniformly;
-               out-of-range results are clamped by SetCursorPos anyway. */
-            RECT rc;
-            GetClientRect(g_hwnd, &rc);
-            pt.x = MulDiv(pt.x, rc.right, GAME_W);
-            pt.y = MulDiv(pt.y, rc.bottom, GAME_H);
+            /* The game emits warp targets in 800x600 logical space.
+               Scale everything uniformly; out-of-range results are
+               clamped by SetCursorPos anyway. */
+            RECT vp;
+            get_viewport(&vp);
+            pt.x = vp.left + MulDiv(pt.x, vp.right - vp.left, GAME_W);
+            pt.y = vp.top + MulDiv(pt.y, vp.bottom - vp.top, GAME_H);
             g_origClientToScreen(g_hwnd, &pt);
             return g_origSetCursorPos(pt.x, pt.y);
         }
@@ -210,12 +289,12 @@ static BOOL WINAPI GetCursorPos_Hook(LPPOINT pt)
 {
     BOOL r = g_origGetCursorPos(pt);
     if (r && g_enabled && g_hwnd) {
-        RECT rc;
+        RECT vp;
         POINT c = *pt;
         g_origScreenToClient(g_hwnd, &c);
-        GetClientRect(g_hwnd, &rc);
-        c.x = MulDiv(c.x, GAME_W, rc.right);
-        c.y = MulDiv(c.y, GAME_H, rc.bottom);
+        get_viewport(&vp);
+        c.x = MulDiv(c.x - vp.left, GAME_W, vp.right - vp.left);
+        c.y = MulDiv(c.y - vp.top, GAME_H, vp.bottom - vp.top);
         g_origClientToScreen(g_hwnd, &c);
         *pt = c;
     }
@@ -232,7 +311,8 @@ static void patch_import_thunk(PIMAGE_IMPORT_DESCRIPTOR imp,
         if (lstrcmpiA(name, dllname) == 0)
             break;
     }
-    if (!imp->Name) { logmsg("import dll not found"); logmsg(dllname); return; }
+    if (!imp->Name)
+        return;
     {
         DWORD *thunk = (DWORD *)(base + imp->FirstThunk);
         DWORD i;
@@ -250,8 +330,6 @@ static void patch_import_thunk(PIMAGE_IMPORT_DESCRIPTOR imp,
             }
         }
     }
-    logmsg("thunk not found");
-    logmsg(dllname);
 }
 
 static void hook_module(HMODULE mod, const char *dllname, FARPROC real,
