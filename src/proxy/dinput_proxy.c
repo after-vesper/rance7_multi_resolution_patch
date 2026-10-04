@@ -69,7 +69,10 @@ static void load_config(void)
     g_smooth = GetPrivateProfileIntA("Display", "Filter", 1, path);
     g_mode = GetPrivateProfileIntA("Display", "ScaleMode", 1, path);
     g_full = GetPrivateProfileIntA("Display", "Fullscreen", 0, path);
-    g_enabled = g_full || (g_outW > GAME_W && g_outH > GAME_H);
+    /* Hooks stay enabled even at 800x600: the path degenerates to a
+       1:1 transfer identical to the original behavior, and keeping it
+       on avoids a special "disabled" state. */
+    g_enabled = 1;
 }
 
 /* --- window management -------------------------------------------------- */
@@ -184,10 +187,6 @@ static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             } else {
                 g_full = !g_full;
             }
-            /* Borderless implies scaling is active even if the
-               configured resolution is the native 800x600. */
-            g_enabled = g_full ||
-                        (g_outW > GAME_W && g_outH > GAME_H);
             ensure_window_size();
             return 0;
         }
@@ -324,7 +323,6 @@ static void apply_resolution(int w, int h)
     char b[16];
     g_outW = w;
     g_outH = h;
-    g_enabled = g_full || (w > GAME_W && h > GAME_H);
     wsprintfA(b, "%d", w);
     WritePrivateProfileStringA("Display", "Width", b, g_iniPath);
     wsprintfA(b, "%d", h);
@@ -396,9 +394,8 @@ static void build_dialog_template(void)
     p = (WORD *)(t + 1);
     *p++ = 0;
     *p++ = 0;
-    /* "ｶｲｿﾞｳﾄﾞ" in half-width katakana */
-    p = dlg_put_str(p, L"\xFF76\xFF72\xFF7E\xFF9E\xFF73"
-                      L"\xFF84\xFF9E");
+    /* "解像度" */
+    p = dlg_put_str(p, L"解像度");
     *p++ = 9;
     p = dlg_put_str(p, L"MS UI Gothic");
     p = dlg_item(p, 0x0085,
@@ -514,13 +511,31 @@ static BOOL WINAPI BitBlt_Hook(HDC dst, int x, int y, int cx, int cy,
                             L"\xFF8E\xFF9E\xFF70\xFF80\xFF9E\xFF70"
                             L"\xFF9A\xFF7D\xFF8C\xFF99\xFF7D\xFF78"
                             L"\xFF98\xFF70\xFF9D(&B)      Alt+B");
-                InsertMenuW(sys, 2,
-                            MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-                /* "ｶｲｿﾞｳﾄﾞ(&Z)..." in half-width katakana */
-                InsertMenuW(sys, 3, MF_BYPOSITION | MF_STRING,
-                            CMD_RESOLUTION,
-                            L"\xFF76\xFF72\xFF7E\xFF9E\xFF73"
-                            L"\xFF84\xFF9E(&Z)...");
+            }
+            /* The resolution item goes into the Settings (設定)
+               submenu, right below its "fullscreen mode" entry
+               (command id 129), preceded by a separator. */
+            {
+                HMENU set = m ? GetSubMenu(m, 1) : NULL;
+                int i, n, pos = -1;
+                if (set &&
+                    GetMenuState(set, CMD_RESOLUTION, MF_BYCOMMAND)
+                        == (UINT)-1) {
+                    n = GetMenuItemCount(set);
+                    for (i = 0; i < n; i++)
+                        if (GetMenuItemID(set, i) == 129) {
+                            pos = i;
+                            break;
+                        }
+                    if (pos < 0)
+                        pos = n - 1;
+                    InsertMenuW(set, pos + 1,
+                                MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+                    InsertMenuW(set, pos + 2,
+                                MF_BYPOSITION | MF_STRING,
+                                CMD_RESOLUTION,
+                                L"\x89E3\x50CF\x5EA6(&Z)...");
+                }
             }
         }
         if (w && g_hwnd && w == g_hwnd && g_enabled &&
